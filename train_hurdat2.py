@@ -6,6 +6,7 @@ from torch.distributions import Normal
 from torch.utils.data import DataLoader, TensorDataset
 import pandas as pd
 import mixture_model as model
+from sklearn.model_selection import train_test_split
 
 # Dataset Parsing
 def parse_hurricane_data(file_path):
@@ -38,58 +39,56 @@ hurricanes_data = parse_hurricane_data(file_path)
 
 # Training configuration
 input_dim = 1
-lstm_output_dim = 128
-latent_dim = 16
+lstm_output_dim = 64
+latent_dim = 32
 future_steps = 10
-beta = 1.0
+# beta = 1.0
 epochs = 50
-learning_rate = 1e-5
-batch_size = 128 
-lstm_layers = 10
-threshold = 100 
+learning_rate = 5e-3
+# lstm_layers = 10
+threshold = 95 
 
 # Train-test split with 80% for training and 20% for testing
 train_ratio = 0.8
-X_train_data = []
-y_test_data = []
+X_data = []
+y_data = []
 
 # Split the dataset into sequences
 for wind_speeds in hurricanes_data:
     split_idx = int(len(wind_speeds) * train_ratio)
-    X_train_data.append(torch.tensor(wind_speeds[:split_idx]).float().unsqueeze(1))  # 80% for training
-    y_test_data.append(torch.tensor(wind_speeds[split_idx:split_idx + future_steps]).float())  # 20% for testing
+    X_data.append(torch.tensor(wind_speeds[:split_idx]).float().unsqueeze(1))  # 80% for training
+    y_data.append(torch.tensor(wind_speeds[split_idx:split_idx + future_steps]).float())  # 20% for testing
 
-X_padded = pad_sequence(X_train_data, batch_first=True)  # Padded training sequences
-y_test_padded = pad_sequence(y_test_data, batch_first=True)  # Padded test sequences
-y_train = torch.rand((X_padded.size(0), future_steps))  # Simulate target data for loss calculation on the training set
+X_length = torch.tensor([len(t) for t in X_data])
+y_length = torch.tensor([len(t) for t in y_data])
+X_padded = pad_sequence(X_data, batch_first=True)  # Padded training sequences
+y_padded = pad_sequence(y_data, batch_first=True)  # Padded test sequences
+
+X_train, X_test, X_length_train, X_length_test, y_train, y_test, y_length_train, y_length_test = train_test_split(X_padded, X_length, y_padded, y_length, test_size=0.2, random_state=42)
+
+X_train_packed = torch.nn.utils.rnn.pack_padded_sequence(X_train, X_length_train, batch_first=True, enforce_sorted=False)
+X_test_packed = torch.nn.utils.rnn.pack_padded_sequence(X_test, X_length_test, batch_first=True, enforce_sorted=False)
 
 # Instantiate the model and optimizer
-vae = model.VAE(input_dim=input_dim, lstm_output_dim=lstm_output_dim, latent_dim=latent_dim, future_steps=future_steps, beta=beta)
+vae = model.VAE(input_dim=input_dim, lstm_output_dim=lstm_output_dim, latent_dim=latent_dim, future_steps=future_steps)
 optimizer = torch.optim.Adam(vae.parameters(), lr=learning_rate)
 
-# Data loader for batch processing
-train_data = TensorDataset(X_padded, y_train)
-train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True)
-
-# Training loop with batch loading
 for epoch in range(epochs):
     vae.train()
-    epoch_loss = 0
-    for X_batch, y_batch in train_loader:
-        optimizer.zero_grad()
-        reconstructed, z_mean_normal, z_log_var_normal, z_scale_extreme, z_shape_extreme = vae(X_batch)
-        loss = vae.loss_function(reconstructed, y_batch, z_mean_normal, z_log_var_normal, z_scale_extreme, z_shape_extreme)
-        
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(vae.parameters(), max_norm=1.0)  # Gradient clipping
-        optimizer.step()
-        
-        epoch_loss += loss.item()
-    print(f"Epoch {epoch + 1}/{epochs}, Loss: {epoch_loss / len(train_loader):.4f}")
+    optimizer.zero_grad()
+    reconstructed, z_mean_normal, z_log_var_normal, z_scale_extreme, z_shape_extreme = vae(X_train_packed)
+    loss = vae.loss_function(reconstructed, y_train, z_mean_normal, z_log_var_normal, z_scale_extreme, z_shape_extreme, threshold)
+    loss.backward()
+    optimizer.step()
+    print(f"Epoch {epoch + 1}/{epochs}, Loss: {loss.item():.4f}")
+
+    pi_gaussian, pi_gpd = F.softmax(vae.pi_params, dim=0)
+    print(f"pi_gaussian: {pi_gaussian.item():.4f}, pi_gpd: {pi_gpd.item():.4f}\n")
+
 
 # Evaluation on the test set
 with torch.no_grad():
     vae.eval()
-    test_predictions, _, _, _, _ = vae(X_padded)
-    rmse_score = model.rmse(test_predictions, y_test_padded)
+    test_predictions, _, _, _, _ = vae(X_test_packed)
+    rmse_score = model.rmse(test_predictions, y_test)
     print(f"Test RMSE: {rmse_score.item():.4f}")

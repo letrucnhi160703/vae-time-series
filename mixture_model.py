@@ -13,36 +13,33 @@ def reparameterize_gpd(scale, shape, size):
     uniform_sample = torch.rand(size)
     return scale / shape * ((1 - uniform_sample) ** (-shape) - 1)
 
-# Dataset Parsing
-def parse_hurricane_data(file_path):
-    hurricanes = []
-    hurricane_data = []
-    header = None
+def kl_divergence_gpd_trapezoidal(z_scale_extreme, z_shape_extreme, threshold, data_extreme, n_intervals=100):
+    # Define the interval
+    x_min = threshold + 0.01 if threshold == 0 else threshold
+    x_max = data_extreme.max().item()
+    h = (x_max - x_min) / n_intervals
 
-    with open(file_path, 'r') as file:
-        for line in file:
-            if 'AL' in line:
-                if header and len(hurricane_data) > 24:
-                    wind_speeds = [float(row[6]) for row in hurricane_data if row[6] != '-999']
-                    if len(wind_speeds) > 24:
-                        hurricanes.append(wind_speeds[:100])  # Truncate to 100 if longer
-                header = line
-                hurricane_data = []
-            else:
-                hurricane_data.append(line.strip().split(','))
+    x_values = torch.linspace(x_min, x_max, n_intervals)
 
-    if header and len(hurricane_data) > 24:
-        wind_speeds = [float(row[6]) for row in hurricane_data if row[6] != '-999']
-        if len(wind_speeds) > 24:
-            hurricanes.append(wind_speeds[:100])
+    p_x = (1 / z_scale_extreme) * (1 + z_shape_extreme * (x_values / z_scale_extreme)) ** (-1 / z_shape_extreme - 1)
+    q_x = (1 / z_scale_extreme.exp()) * (1 + z_shape_extreme.pow(2) * (x_values / z_scale_extreme.exp())) ** (-1 / z_shape_extreme.pow(2) - 1)
 
-    return hurricanes
+    kl_values = p_x * torch.log(p_x / q_x)
+
+    kl_gpd = h * (kl_values[0] / 2 + kl_values[1:-1].sum() + kl_values[-1] / 2)
+    return kl_gpd.mean()
+
+# Function to classify observations into normal and extreme based on threshold
+def classify_observations(y, threshold):
+    normal_mask = y.abs() <= threshold
+    extreme_mask = y.abs() > threshold
+    return normal_mask, extreme_mask
 
 # Adjusted Encoder with additional linear layers and dropout
 class Encoder(nn.Module):
     def __init__(self, input_dim, lstm_output_dim, latent_dim):
         super(Encoder, self).__init__()
-        self.lstm = nn.LSTM(input_dim, lstm_output_dim, num_layers=10, batch_first=True, dropout=0.1)
+        self.lstm = nn.LSTM(input_dim, lstm_output_dim, num_layers=10, batch_first=True, dropout=0.2)
         
         # Additional fully connected layers with dropout
         self.fc1 = nn.Linear(lstm_output_dim, 128)
@@ -50,16 +47,18 @@ class Encoder(nn.Module):
         self.dropout = nn.Dropout(0.3)
         
         # Gaussian parameters for normal observations
-        self.mean_layer_normal = nn.Linear(64, latent_dim)
-        self.logvar_layer_normal = nn.Linear(64, latent_dim)
+        self.mean_layer_normal = nn.Linear(lstm_output_dim, latent_dim)
+        self.logvar_layer_normal = nn.Linear(lstm_output_dim, latent_dim)
         
         # GPD parameters for extreme observations
-        self.scale_layer_extreme = nn.Linear(64, latent_dim)
-        self.shape_layer_extreme = nn.Linear(64, latent_dim)
+        self.scale_layer_extreme = nn.Linear(lstm_output_dim, latent_dim)
+        self.shape_layer_extreme = nn.Linear(lstm_output_dim, latent_dim)
 
-    def forward(self, X):
-        lstm_out, _ = self.lstm(X)
-        lstm_out = lstm_out[:, -1, :]  # Take the last time step output
+    def forward(self, packed_x):
+        # lstm_out, _ = self.lstm(X)
+        packed_lstm_out, _ = self.lstm(packed_x) 
+        lstm_out, length_out = torch.nn.utils.rnn.pad_packed_sequence(packed_lstm_out)   
+        lstm_out = lstm_out[-1, :, :]  # Take the last time step output
         
         # Pass through additional layers
         hidden = F.relu(self.fc1(lstm_out))
@@ -67,17 +66,18 @@ class Encoder(nn.Module):
         
         z_mean_normal = self.mean_layer_normal(hidden)
         z_log_var_normal = self.logvar_layer_normal(hidden)
-        z_scale_extreme = torch.exp(self.scale_layer_extreme(hidden))  # Ensure scale is positive
-        z_shape_extreme = self.shape_layer_extreme(hidden)  # Shape can be positive or negative
+        z_scale_extreme = torch.exp(self.scale_layer_extreme(hidden))
+        z_shape_extreme = self.shape_layer_extreme(hidden)
         return z_mean_normal, z_log_var_normal, z_scale_extreme, z_shape_extreme
 
 # Adjusted Decoder with additional linear layers and dropout
 class Decoder(nn.Module):
     def __init__(self, latent_dim, future_steps):
         super(Decoder, self).__init__()
+        self.dense1 = nn.Linear(latent_dim, 500)
         self.fc1 = nn.Linear(latent_dim, 128)
         self.fc2 = nn.Linear(128, 500)
-        self.dropout = nn.Dropout(0.3)
+        self.dropout = nn.Dropout(0.2)
         self.out = nn.Linear(500, future_steps)
 
         # Final FCN layer
@@ -99,8 +99,9 @@ class VAE(nn.Module):
         self.beta = beta
         
         # Initialize mixture distribution weights
-        self.pi_gaussian = nn.Parameter(torch.tensor(0.9))  # Weight for Gaussian
-        self.pi_gpd = nn.Parameter(torch.tensor(0.1))       # Weight for GPD
+        # self.pi_gaussian = nn.Parameter(torch.tensor(0.9))  # Weight for Gaussian
+        # self.pi_gpd = nn.Parameter(torch.tensor(0.1))       # Weight for GPD
+        self.pi_params = nn.Parameter(torch.tensor([3.0, 0.01]))
 
     def reparameterize(self, z_mean_normal, z_log_var_normal, z_scale_extreme, z_shape_extreme):
         choice = torch.rand(z_mean_normal.size(0))  # Batch size
@@ -110,7 +111,7 @@ class VAE(nn.Module):
         z_gpd = reparameterize_gpd(z_scale_extreme, z_shape_extreme, z_mean_normal.size())
 
         for i in range(z.size(0)):
-            if choice[i] < self.pi_gaussian:
+            if choice[i] < F.softmax(self.pi_params, dim=0)[0]:
                 z[i] = z_gaussian[i]
             else:
                 z[i] = z_gpd[i]
@@ -123,16 +124,25 @@ class VAE(nn.Module):
         reconstructed = self.decoder(z)
         return reconstructed, z_mean_normal, z_log_var_normal, z_scale_extreme, z_shape_extreme
 
-    def loss_function(self, reconstructed, y, z_mean_normal, z_log_var_normal, z_scale_extreme, z_shape_extreme):
-        R_gaussian = F.mse_loss(reconstructed, y, reduction='mean')
+    def loss_function(self, reconstructed, y, z_mean_normal, z_log_var_normal, z_scale_extreme, z_shape_extreme, threshold):
+        pi_gaussian, pi_gpd = F.softmax(self.pi_params, dim=0)
+        
+        normal_mask, extreme_mask = classify_observations(y, threshold)
+
+        # Gaussian loss for normal observations
+        R_gaussian = F.mse_loss(reconstructed[normal_mask], y[normal_mask], reduction='mean')
         KL_gaussian = -0.5 * torch.sum(1 + z_log_var_normal - z_mean_normal.pow(2) - z_log_var_normal.exp(), dim=-1).mean()
-        Loss_gaussian = self.pi_gaussian * (R_gaussian + self.beta * KL_gaussian)
+        Loss_gaussian = pi_gaussian * (R_gaussian + self.beta * KL_gaussian)
         
-        R_gpd = F.mse_loss(reconstructed, y, reduction='mean')
+        # GPD loss for extreme observations
+        R_gpd = F.mse_loss(reconstructed[extreme_mask], y[extreme_mask], reduction='mean')
         KL_gpd = -0.5 * torch.sum(1 + z_scale_extreme - z_shape_extreme.pow(2) - z_scale_extreme.exp(), dim=-1).mean()
-        Loss_gpd = self.pi_gpd * (R_gpd + self.beta * KL_gpd)
+        # KL_gpd = kl_divergence_gpd_trapezoidal(z_scale_extreme, z_shape_extreme, threshold, y[extreme_mask])
+        Loss_gpd = pi_gpd * (R_gpd + self.beta * KL_gpd)
         
-        Loss_mixture = Loss_gaussian + Loss_gpd
+        # Mixture distribution loss (comparison with full time series)
+        R_mixture = F.mse_loss(reconstructed, y, reduction='mean')
+        Loss_mixture = R_mixture + Loss_gaussian + Loss_gpd
         return Loss_mixture
 
 # Define RMSE evaluation function
