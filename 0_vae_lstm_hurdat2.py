@@ -5,6 +5,7 @@ from sklearn.model_selection import train_test_split
 from torch.nn.utils.rnn import pad_sequence
 from sklearn.preprocessing import StandardScaler
 import numpy as np
+import pandas as pd
 
 # Encoder class
 class Encoder(nn.Module):
@@ -101,9 +102,8 @@ y_data = []
 
 for wind_speeds in hurricanes_data:
     split_idx = int(len(wind_speeds) * train_ratio)
-    X_data.append(torch.tensor(wind_speeds[:split_idx]).float().unsqueeze(1))  # 80% for training
-    y_data.append(torch.tensor(wind_speeds[split_idx:split_idx + future_steps]).float())  # 20% for testing
-
+    X_data.append(torch.tensor(wind_speeds[:split_idx]).float().unsqueeze(1))
+    y_data.append(torch.tensor(wind_speeds[split_idx:split_idx + future_steps]).float())
 X_length = torch.tensor([len(t) for t in X_data])
 y_length = torch.tensor([len(t) for t in y_data])
 X_padded = pad_sequence(X_data, batch_first=True)  # Padded training sequences
@@ -113,18 +113,10 @@ X_train, X_test, X_length_train, X_length_test, y_train, y_test, y_length_train,
 
 X_train_packed = torch.nn.utils.rnn.pack_padded_sequence(X_train, X_length_train, batch_first=True, enforce_sorted=False)
 X_test_packed = torch.nn.utils.rnn.pack_padded_sequence(X_test, X_length_test, batch_first=True, enforce_sorted=False)
-# y_train_packed = torch.nn.utils.rnn.pack_padded_sequence(y_train, y_length_train, batch_first=True, enforce_sorted=False)
-# y_test_packed = torch.nn.utils.rnn.pack_padded_sequence(y_test, y_length_test, batch_first=True, enforce_sorted=False)
-
-# scaler=StandardScaler()
-# X_train_data=scaler.fit_transform(np.array(X_train_data).reshape(-1,1))
 
 # Instantiate the model and optimizer
 vae = VAE(input_dim=input_dim, lstm_output_dim=output_dim, latent_dim=latent_dim, future_steps=future_steps)
 optimizer = torch.optim.Adam(vae.parameters(), lr=learning_rate)
-
-# Simulate target data for loss calculation on the training set
-# y_train = torch.rand((X_padded.size(0), future_steps))
 
 # Training loop
 for epoch in range(epochs):
@@ -146,3 +138,16 @@ with torch.no_grad():
     test_predictions, _, _ = vae(X_test_packed)
     rmse_score = rmse(test_predictions, y_test)
     print(f"Test RMSE: {rmse_score.item():.4f}")
+    test_predictions = test_predictions.numpy()
+    if isinstance(y_test, list):
+        y_test = torch.tensor(y_test)
+    y_test_numpy = y_test.cpu().numpy()
+
+    results_df = pd.DataFrame({
+    'Truth': y_test_numpy.flatten(),
+    'Predictions': test_predictions.flatten()
+    })
+
+    # Xuất ra file CSV
+    results_df.to_csv('predictions_vs_truth.csv', index=False)
+    print("Results saved to 'predictions_vs_truth.csv'")

@@ -90,5 +90,19 @@ for epoch in range(epochs):
 with torch.no_grad():
     vae.eval()
     test_predictions, _, _, _, _ = vae(X_test_packed)
+    # test_predictions, _, _, _, _ = vae(X_test)
     rmse_score = model.rmse(test_predictions, y_test)
     print(f"Test RMSE: {rmse_score.item():.4f}")
+    test_predictions = test_predictions.numpy()
+    if isinstance(y_test, list):
+        y_test = torch.tensor(y_test)
+    y_test_numpy = y_test.cpu().numpy()
+
+    results_df = pd.DataFrame({
+    'Truth': y_test_numpy.flatten(),
+    'Predictions': test_predictions.flatten()
+    })
+
+    # Xuất ra file CSV
+    results_df.to_csv('predictions_vs_truth.csv', index=False)
+    print("Results saved to 'predictions_vs_truth.csv'")

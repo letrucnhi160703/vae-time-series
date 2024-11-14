@@ -101,6 +101,21 @@ class ARModel(nn.Module):
         x = x[:, -input_steps:].squeeze(-1)
         return self.linear(x)
 
+# Baseline 4: Transformer
+class TransformerTimeSeriesModel(nn.Module):
+    def __init__(self, input_dim, d_model, nhead, num_layers, future_steps):
+        super(TransformerTimeSeriesModel, self).__init__()
+        self.embedding = nn.Linear(input_dim, d_model)  # Embedding layer to map input_dim to d_model
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.fc = nn.Linear(d_model, future_steps)  # Fully connected layer for final prediction
+
+    def forward(self, x):
+        x = self.embedding(x)  # Embed input to d_model
+        transformer_output = self.transformer_encoder(x.permute(1, 0, 2))  # Transformer expects (seq_len, batch, d_model)
+        output = self.fc(transformer_output[-1])  # Use the last output for future steps prediction
+        return output
+    
 # Training function for baselines
 def train_baseline(model, optimizer, X_train, y_train, epochs):
     for epoch in range(epochs):
@@ -112,16 +127,23 @@ def train_baseline(model, optimizer, X_train, y_train, epochs):
         optimizer.step()
         print(f"Epoch {epoch + 1}/{epochs}, Loss: {loss.item():.4f}")
 
+# Transformer model configuration
+d_model = 64
+nhead = 8
+num_layers = 2
+
 # Initialize baselines
 input_steps = X_train.size(1)
 simple_lstm = SimpleLSTM(input_dim, output_dim, future_steps)
 simple_rnn = SimpleRNN(input_dim, output_dim, future_steps)
 ar_model = ARModel(input_steps, future_steps)
+transformer_model = TransformerTimeSeriesModel(input_dim=input_dim, d_model=d_model, nhead=nhead, num_layers=num_layers, future_steps=future_steps)
 
 # Optimizers
 optimizer_lstm = optim.Adam(simple_lstm.parameters(), lr=learning_rate)
 optimizer_rnn = optim.Adam(simple_rnn.parameters(), lr=learning_rate)
 optimizer_ar = optim.Adam(ar_model.parameters(), lr=learning_rate)
+optimizer_transformer = optim.Adam(transformer_model.parameters(), lr=learning_rate)
 
 # Train baselines
 print("Training Simple LSTM:")
@@ -133,15 +155,21 @@ train_baseline(simple_rnn, optimizer_rnn, X_train, y_train, epochs)
 print("Training AR Model:")
 train_baseline(ar_model, optimizer_ar, X_train, y_train, epochs)
 
+print("Training Transformer:")
+train_baseline(transformer_model, optimizer_transformer, X_train, y_train, epochs)
+
 # Evaluation
 with torch.no_grad():
     simple_lstm.eval()
     simple_rnn.eval()
     ar_model.eval()
+    transformer_model.eval()
     lstm_rmse = rmse(simple_lstm(X_test), y_test)
     rnn_rmse = rmse(simple_rnn(X_test), y_test)
     ar_rmse = rmse(ar_model(X_test), y_test)
+    transformer_rmse = rmse(transformer_model(X_test), y_test)
 
 print(f"Simple LSTM Test RMSE: {lstm_rmse.item():.4f}")
 print(f"Simple RNN Test RMSE: {rnn_rmse.item():.4f}")
 print(f"AR Model Test RMSE: {ar_rmse.item():.4f}")
+print(f"Transformer Test RMSE: {transformer_rmse.item():.4f}")
