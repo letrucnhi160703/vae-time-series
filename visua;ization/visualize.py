@@ -1,3 +1,8 @@
+# This file contains the code to visualize the model predictions vs truth values.
+# The predictions_vs_truth.csv file contains the truth and predictions values for the test set.
+# The file is generated in training files at test time.
+
+
 import pandas as pd
 import matplotlib.pyplot as plt
 

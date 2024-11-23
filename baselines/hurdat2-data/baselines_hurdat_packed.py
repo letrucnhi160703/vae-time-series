@@ -6,6 +6,8 @@ from torch.nn.utils.rnn import pad_sequence
 from sklearn.preprocessing import StandardScaler
 import numpy as np
 import torch.optim as optim
+import pandas as pd
+import csv
 
 # Function to parse the data
 def parse_hurricane_data(file_path):
@@ -121,8 +123,8 @@ def train_baseline(model, optimizer, X_train, y_train, epochs):
     for epoch in range(epochs):
         model.train()
         optimizer.zero_grad()
-        predictions = model(X_train)
-        loss = F.mse_loss(predictions, y_train)
+        test_predictions = model(X_train)
+        loss = F.mse_loss(test_predictions, y_train)
         loss.backward()
         optimizer.step()
         print(f"Epoch {epoch + 1}/{epochs}, Loss: {loss.item():.4f}")
@@ -133,43 +135,55 @@ nhead = 8
 num_layers = 2
 
 # Initialize baselines
-input_steps = X_train.size(1)
-simple_lstm = SimpleLSTM(input_dim, output_dim, future_steps)
-simple_rnn = SimpleRNN(input_dim, output_dim, future_steps)
-ar_model = ARModel(input_steps, future_steps)
+# input_steps = X_train.size(1)
+# simple_lstm = SimpleLSTM(input_dim, output_dim, future_steps)
+# simple_rnn = SimpleRNN(input_dim, output_dim, future_steps)
+# ar_model = ARModel(input_steps, future_steps)
 transformer_model = TransformerTimeSeriesModel(input_dim=input_dim, d_model=d_model, nhead=nhead, num_layers=num_layers, future_steps=future_steps)
 
 # Optimizers
-optimizer_lstm = optim.Adam(simple_lstm.parameters(), lr=learning_rate)
-optimizer_rnn = optim.Adam(simple_rnn.parameters(), lr=learning_rate)
-optimizer_ar = optim.Adam(ar_model.parameters(), lr=learning_rate)
+# optimizer_lstm = optim.Adam(simple_lstm.parameters(), lr=learning_rate)
+# optimizer_rnn = optim.Adam(simple_rnn.parameters(), lr=learning_rate)
+# optimizer_ar = optim.Adam(ar_model.parameters(), lr=learning_rate)
 optimizer_transformer = optim.Adam(transformer_model.parameters(), lr=learning_rate)
 
 # Train baselines
-print("Training Simple LSTM:")
-train_baseline(simple_lstm, optimizer_lstm, X_train, y_train, epochs)
+# print("Training Simple LSTM:")
+# train_baseline(simple_lstm, optimizer_lstm, X_train, y_train, epochs)
 
-print("Training Simple RNN:")
-train_baseline(simple_rnn, optimizer_rnn, X_train, y_train, epochs)
+# print("Training Simple RNN:")
+# train_baseline(simple_rnn, optimizer_rnn, X_train, y_train, epochs)
 
-print("Training AR Model:")
-train_baseline(ar_model, optimizer_ar, X_train, y_train, epochs)
+# print("Training AR Model:")
+# train_baseline(ar_model, optimizer_ar, X_train, y_train, epochs)
 
 print("Training Transformer:")
 train_baseline(transformer_model, optimizer_transformer, X_train, y_train, epochs)
 
 # Evaluation
 with torch.no_grad():
-    simple_lstm.eval()
-    simple_rnn.eval()
-    ar_model.eval()
-    transformer_model.eval()
-    lstm_rmse = rmse(simple_lstm(X_test), y_test)
-    rnn_rmse = rmse(simple_rnn(X_test), y_test)
-    ar_rmse = rmse(ar_model(X_test), y_test)
-    transformer_rmse = rmse(transformer_model(X_test), y_test)
+    with open('predictions_vs_truth.csv', mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(["Truth", "Predictions"])
+        # simple_lstm.eval()
+        # simple_rnn.eval()
+        # ar_model.eval()
+        transformer_model.eval()
+        # lstm_rmse = rmse(simple_lstm(X_test), y_test)
+        # rnn_rmse = rmse(simple_rnn(X_test), y_test)
+        # ar_rmse = rmse(ar_model(X_test), y_test)
+        transformer_rmse = rmse(transformer_model(X_test), y_test)
 
-print(f"Simple LSTM Test RMSE: {lstm_rmse.item():.4f}")
-print(f"Simple RNN Test RMSE: {rnn_rmse.item():.4f}")
-print(f"AR Model Test RMSE: {ar_rmse.item():.4f}")
+        with torch.no_grad():
+                # test_predictions = simple_lstm(X_test)
+                # test_predictions = simple_rnn(X_test)
+                # test_predictions = ar_model(X_test)
+                test_predictions = transformer_model(X_test)
+                for truth, prediction in zip(y_test, test_predictions):
+                    for true_val, pred_val in zip(truth.tolist(), prediction.tolist()):
+                        writer.writerow([true_val, pred_val])
+
+# print(f"Simple LSTM Test RMSE: {lstm_rmse.item():.4f}")
+# print(f"Simple RNN Test RMSE: {rnn_rmse.item():.4f}")
+# print(f"AR Model Test RMSE: {ar_rmse.item():.4f}")
 print(f"Transformer Test RMSE: {transformer_rmse.item():.4f}")
