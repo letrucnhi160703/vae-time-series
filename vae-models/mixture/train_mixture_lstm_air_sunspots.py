@@ -40,9 +40,12 @@ data = load_csv_dataset(file_path)
 # Sliding window parameters
 window_length = 4
 predict_steps = 1
+percentile = 95
 
 # Create Sliding Windows
 X_data, Y_data = create_sliding_windows(data, window_length, predict_steps)
+
+threshold = np.percentile(X_data, percentile)
 
 # Convert to NumPy arrays
 X_data = np.array(X_data, dtype=np.float32)
@@ -60,6 +63,12 @@ y_train = scaler_y.fit_transform(y_train)
 
 X_test = scaler_X.transform(X_test.reshape(-1, window_length)).reshape(-1, window_length, 1)
 y_test = scaler_y.transform(y_test)
+
+threshold_array = np.full((1, window_length), threshold) # [95, 95, 95, 95]
+threshold = scaler_X.transform(threshold_array)
+threshold = threshold[0][0]
+print(f"Threshold at Q {percentile}% is: {threshold}")
+
 
 # Convert to PyTorch tensors
 X_train = torch.tensor(X_train, dtype=torch.float32)
