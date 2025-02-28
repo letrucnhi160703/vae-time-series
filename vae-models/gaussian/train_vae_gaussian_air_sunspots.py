@@ -8,7 +8,7 @@ import numpy as np
 import csv
 import pandas as pd
 import torch.optim as optim
-from vae_lstm_model import VAE
+from vae_gaussian_model import VAE
 
 # Sliding Window Data Preparation
 def create_sliding_windows(data, window_length=4, predict_steps=1):
@@ -34,7 +34,7 @@ def rmse(predictions, targets):
 
 # Load your CSV file
 # file_path = 'AirPassengers.csv'
-file_path = 'sunspots.csv'
+file_path = '../../datasets/sunspots.csv'
 data = load_csv_dataset(file_path)
 
 # Sliding window parameters

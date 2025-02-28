@@ -127,5 +127,7 @@ class VAE(nn.Module):
 
         R_mixture = F.mse_loss(reconstructed, y, reduction='mean')
         Loss_mixture = R_mixture + Loss_gaussian + Loss_gpd
+
+        print("Scale: ", z_scale_extreme)
         return Loss_mixture
 
