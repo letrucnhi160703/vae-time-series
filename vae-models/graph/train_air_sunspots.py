@@ -33,6 +33,7 @@ def rmse(predictions, targets):
     return torch.sqrt(F.mse_loss(predictions, targets))
 
 # Load your CSV file
+# file_path = 'datasets/sunspots.csv'
 file_path = '../../datasets/sunspots.csv'
 # file_path = '../../datasets/AirPassengers.csv'
 # file_path = '../../datasets/LD2011_2014_less.csv'
@@ -45,7 +46,7 @@ percentile = 95
 
 # Create Sliding Windows
 X_data, Y_data = create_sliding_windows(data, window_length, predict_steps)
-threshold = np.percentile(X_data, percentile)
+threshold = np.percentile(Y_data, percentile)
 
 # Convert to NumPy arrays
 X_data = np.array(X_data, dtype=np.float32)
@@ -65,9 +66,8 @@ y_train = scaler_y.fit_transform(y_train)
 X_test = scaler_X.transform(X_test.reshape(-1, window_length)).reshape(-1, window_length, 1)
 y_test = scaler_y.transform(y_test)
 
-threshold_array = np.full((1, window_length), threshold) # [95, 95, 95, 95]
-threshold = scaler_X.transform(threshold_array)
-threshold = threshold[0][0]
+threshold_scaled = scaler_y.transform(np.array([[threshold]]))
+threshold = threshold_scaled[0, 0]
 print(f"Threshold at Q {percentile}% is: {threshold}")
 
 # Convert to PyTorch tensors
@@ -93,7 +93,7 @@ epochs = 20
 learning_rate = 1e-3
 
 # Instantiate the model and optimizer
-vae = VAE(input_dim=input_dim, lstm_output_dim=output_dim, gcn_output_dim=0, latent_dim=latent_dim, future_steps=predict_steps, use_d_knn=False, use_gcn=False, use_gpd=True, use_bernoulli=False)
+vae = VAE(input_dim=input_dim, lstm_output_dim=output_dim, gcn_output_dim=0, latent_dim=latent_dim, future_steps=predict_steps, use_d_knn=False, use_gcn=False, use_gpd=True, use_bernoulli=True)
 optimizer = torch.optim.Adam(vae.parameters(), lr=learning_rate)
 
 # Evaluate with batches

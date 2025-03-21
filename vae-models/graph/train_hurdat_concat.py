@@ -69,7 +69,7 @@ future_steps = 1
 epochs = 20
 learning_rate = 5e-5
 batch_size = 16
-threshold = 95
+percentile = 95
 
 # epochs = 20
 # learning_rate = 0.001
@@ -81,6 +81,8 @@ X_data, Y_data = create_sliding_windows(hurricanes_data, window_length, predict_
 # Convert to NumPy arrays
 X_data = np.array(X_data, dtype=np.float32)
 Y_data = np.array(Y_data, dtype=np.float32)
+
+threshold = np.percentile(Y_data, percentile, axis=0)
 
 # Train-Test Split
 X_train, X_test, y_train, y_test = train_test_split(X_data, Y_data, test_size=0.2, random_state=42)
@@ -95,6 +97,11 @@ y_train = scaler_y.fit_transform(y_train)
 X_test = scaler_X.transform(X_test.reshape(-1, window_length)).reshape(-1, window_length, 1)
 y_test = scaler_y.transform(y_test)
 
+
+threshold_scaled = scaler_y.transform(np.array([threshold]).reshape(-1, 1))
+threshold = threshold_scaled[0, 0]
+print(f"Threshold at Q {percentile}% is: {threshold}")
+
 # Convert to PyTorch tensors
 X_train = torch.tensor(X_train, dtype=torch.float32)
 y_train = torch.tensor(y_train, dtype=torch.float32)
@@ -103,7 +110,6 @@ X_test = torch.tensor(X_test, dtype=torch.float32)
 y_test = torch.tensor(y_test, dtype=torch.float32)
 
 # DataLoader
-batch_size = 32
 train_dataset = TensorDataset(X_train, y_train)
 test_dataset = TensorDataset(X_test, y_test)
 

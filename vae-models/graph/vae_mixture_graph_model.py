@@ -24,10 +24,10 @@ def reparameterize_bernoulli(logits):
 
 # Classify observations
 def classify_observations(y, threshold, use_gpd=True, use_bernoulli=True):
-    normal_mask = (y.abs() <= threshold)
+    normal_mask = (y <= threshold)
     
     if use_gpd:
-        extreme_mask = (y.abs() > threshold)
+        extreme_mask = (y > threshold)
     else:
         extreme_mask = None
     
@@ -219,7 +219,7 @@ class VAE(nn.Module):
     def loss_function(self, reconstructed, y, z_mean_normal, z_log_var_normal, threshold, z_scale_extreme=None, z_shape_extreme=None, z_logits_zero=None, x_full=None, x_missing=None):
         # If not using GPD or Bernoulli, return Gaussian loss
         if not self.use_gpd and not self.use_bernoulli and not self.use_d_knn:
-            R_gaussian = F.l1_loss(reconstructed, y, reduction='mean')
+            R_gaussian = F.mse_loss(reconstructed, y, reduction='mean')
             KL_gaussian = -0.5 * torch.sum(1 + z_log_var_normal - z_mean_normal.pow(2) - z_log_var_normal.exp(), dim=-1).mean()
             # KL_gaussian = 0
             Loss_gaussian = R_gaussian + self.beta * KL_gaussian
@@ -237,8 +237,8 @@ class VAE(nn.Module):
             normal_mask, zero_mask = classify_observations(y, threshold, False, True)
 
         R_gaussian = F.mse_loss(reconstructed[normal_mask], y[normal_mask], reduction='mean')
-        # KL_gaussian = -0.5 * torch.sum(1 + z_log_var_normal - z_mean_normal.pow(2) - z_log_var_normal.exp(), dim=-1).mean()
-        KL_gaussian = 0
+        KL_gaussian = -0.5 * torch.sum(1 + z_log_var_normal - z_mean_normal.pow(2) - z_log_var_normal.exp(), dim=-1).mean()
+        # KL_gaussian = 0
         Loss_gaussian = pi_gaussian * (R_gaussian + self.beta * KL_gaussian)
 
         # GPD Loss
@@ -250,6 +250,9 @@ class VAE(nn.Module):
                 scale_extreme = z_scale_extreme[extreme_mask] # Lọc scale
                 shape_extreme = z_shape_extreme[extreme_mask] # Lọc shape
                 excess = y_extreme - threshold # Tính y_i - u
+                log_scale_extreme = torch.log(scale_extreme)
+                p2 = 1 + 1 / shape_extreme
+                p3 = torch.log(1 + shape_extreme * excess / scale_extreme)
                 gpd_nll = torch.mean(torch.log(scale_extreme) + (1 + 1 / shape_extreme) * torch.log(1 + shape_extreme * excess / scale_extreme))
                 # print('Scale extreme:', scale_extreme)
                 # print('Shape extreme:', shape_extreme)
@@ -266,9 +269,9 @@ class VAE(nn.Module):
             y_zero = y[zero_mask]
             if y_zero.numel() != 0:
                 logits_zero = z_logits_zero[zero_mask]
-                print('Logits zero:', logits_zero)
+                # print('Logits zero:', logits_zero)
                 bernoulli_nll = -torch.mean(y_zero * torch.log(torch.sigmoid(logits_zero)) + (1 - y_zero) * torch.log(1 - torch.sigmoid(logits_zero)))
-                print('Bernoulli NLL:', bernoulli_nll)
+                # print('Bernoulli NLL:', bernoulli_nll)
                 Loss_bernoulli = pi_bernoulli * bernoulli_nll
 
         # D-KNN Loss
