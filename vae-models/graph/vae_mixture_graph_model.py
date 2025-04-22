@@ -24,6 +24,9 @@ def reparameterize_bernoulli(logits):
 
 # Classify observations
 def classify_observations(y, threshold, use_gpd=True, use_bernoulli=True):
+    # threshold = threshold.item()
+    # print("Threshold: ", threshold)
+    # print("y: ", y)
     normal_mask = (y <= threshold)
     
     if use_gpd:
@@ -163,7 +166,7 @@ class VAE(nn.Module):
 
         # Init modules if flags are on
         if self.use_d_knn:
-            self.dk_nn = D_KNN(k=3, tau=1.0)  # D-KNN Imputation
+            self.d_knn = D_KNN(k=3, tau=1.0)  # D-KNN Imputation
 
         self.encoder = LSTM_GCN_Encoder(input_dim, lstm_output_dim, gcn_output_dim, latent_dim, use_gcn, use_gpd, use_bernoulli)
         self.decoder = Decoder(latent_dim, future_steps)
@@ -207,7 +210,7 @@ class VAE(nn.Module):
 
     def forward(self, x_full, x_missing=None, edge_index=None):
         if self.use_d_knn and x_missing is not None:
-            x_imputed = self.dk_nn(x_full, x_full, x_missing)
+            x_imputed = self.d_knn(x_full, x_full, x_missing)
         else:
             x_imputed = x_full  # Nếu không dùng D-KNN, giữ nguyên x_full
 
@@ -250,9 +253,6 @@ class VAE(nn.Module):
                 scale_extreme = z_scale_extreme[extreme_mask] # Lọc scale
                 shape_extreme = z_shape_extreme[extreme_mask] # Lọc shape
                 excess = y_extreme - threshold # Tính y_i - u
-                log_scale_extreme = torch.log(scale_extreme)
-                p2 = 1 + 1 / shape_extreme
-                p3 = torch.log(1 + shape_extreme * excess / scale_extreme)
                 gpd_nll = torch.mean(torch.log(scale_extreme) + (1 + 1 / shape_extreme) * torch.log(1 + shape_extreme * excess / scale_extreme))
                 # print('Scale extreme:', scale_extreme)
                 # print('Shape extreme:', shape_extreme)
@@ -277,7 +277,7 @@ class VAE(nn.Module):
         # D-KNN Loss
         Loss_d_knn = 0
         if self.use_d_knn and x_missing is not None:
-            x_imputed = self.dk_nn(x_full, x_full, x_missing)
+            x_imputed = self.d_knn(x_full, x_full, x_missing)
             Loss_d_knn = 0.1 * F.mse_loss(x_imputed, x_missing, reduction='mean')
 
         # print ("Loss_bernoulli: ", Loss_bernoulli)
