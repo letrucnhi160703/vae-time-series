@@ -4,6 +4,11 @@ import torch.nn.functional as F
 import torch_geometric.nn as pyg_nn
 from torch_geometric.utils import dense_to_sparse
 import numpy as np
+from dcrnn_model import DCRNNModel
+from utils import get_logger
+from torch.utils.tensorboard import SummaryWriter
+import os
+import time
 
 # Gaussian reparameterization function
 def reparameterize_gaussian(mean, logvar):
@@ -72,27 +77,36 @@ class D_KNN(nn.Module):
         return imputed_values
 
 class LSTM_GCN_Encoder(nn.Module):
-    def __init__(self, input_dim, lstm_output_dim, gcn_output_dim, latent_dim, 
-                 use_gcn=True, use_gpd=True, use_bernoulli=True):
+    def __init__(self, adj_mx, latent_dim, use_gpd=True, use_bernoulli=True, **dcrnn_kwargs):
         super(LSTM_GCN_Encoder, self).__init__()
 
         # Module on/off flags
-        self.use_gcn = use_gcn
+        # self.use_gcn = use_gcn
         self.use_gpd = use_gpd
         self.use_bernoulli = use_bernoulli
+        self._kwargs = dcrnn_kwargs
+        self._model_kwargs = dcrnn_kwargs.get('model')
 
-        # self.channel_projection = nn.Linear(input_dim, 45)
+        self._log_dir = self._get_log_dir(dcrnn_kwargs)
+        self._writer = SummaryWriter('runs/' + self._log_dir)
+        log_level = self._kwargs.get('log_level', 'INFO')
+        self._logger = get_logger(self._log_dir, __name__, 'info.log', level=log_level)
+        # # LSTM Layer
+        # self.lstm = nn.LSTM(input_dim, lstm_output_dim, num_layers=3, batch_first=True)
+        # self.layer_norm = nn.LayerNorm(lstm_output_dim)
 
-        # LSTM Layer
-        self.lstm = nn.LSTM(input_dim, lstm_output_dim, num_layers=3, batch_first=True)
-        self.layer_norm = nn.LayerNorm(lstm_output_dim)
+        # # GCN Layer
+        # if self.use_gcn:
+        #     self.gcn = pyg_nn.GCNConv(lstm_output_dim, gcn_output_dim)
+        #     fc_input_dim = gcn_output_dim  # Input dim for FC layers
+        # else:
+        #     fc_input_dim = lstm_output_dim  # If not using GCN, input dim is LSTM output dim
 
-        # GCN Layer
-        if self.use_gcn:
-            self.gcn = pyg_nn.GCNConv(lstm_output_dim, gcn_output_dim)
-            fc_input_dim = gcn_output_dim  # Input dim for FC layers
-        else:
-            fc_input_dim = lstm_output_dim  # If not using GCN, input dim is LSTM output dim
+        # DCRNN Layer
+        self.dcrnn = DCRNNModel(adj_mx, self._logger, **self._model_kwargs)
+        dcrnn_output_dim = self._model_kwargs['num_nodes'] * self._model_kwargs['output_dim']
+
+        fc_input_dim = dcrnn_output_dim
 
         # FC Layers
         self.fc1 = nn.Linear(fc_input_dim, 128)
@@ -112,12 +126,18 @@ class LSTM_GCN_Encoder(nn.Module):
         if self.use_bernoulli:
             self.logits_layer_zero = nn.Linear(64, latent_dim)
 
-    def forward(self, x, edge_index):
-        _, (h_n, _) = self.lstm(x)
-        h_n = self.layer_norm(h_n[-1])  # Take the last hidden state
+    def forward(self, x, y, batches_seen=None):
+        # _, (h_n, _) = self.lstm(x)
+        # h_n = self.layer_norm(h_n[-1])  # Take the last hidden state
 
-        if self.use_gcn:
-            h_n = self.gcn(h_n, edge_index)
+        # if self.use_gcn:
+        #     h_n = self.gcn(h_n, edge_index)
+
+        x = x.transpose(0, 1)
+        dcrnn_output = self.dcrnn(x, y, batches_seen)
+
+        # Lấy output cuối cùng từ chuỗi dự đoán
+        h_n = dcrnn_output[-1]  # Shape: (batch_size, num_nodes * output_dim)
 
         # FC Layers
         hidden = F.relu(self.fc1(h_n))
@@ -140,6 +160,34 @@ class LSTM_GCN_Encoder(nn.Module):
 
         return z_mean_normal, z_log_var_normal, z_scale_extreme, z_shape_extreme, z_logits_zero
 
+    @staticmethod
+    def _get_log_dir(kwargs):
+        log_dir = kwargs['train'].get('log_dir')
+        if log_dir is None:
+            batch_size = kwargs['data'].get('batch_size')
+            learning_rate = kwargs['train'].get('base_lr')
+            max_diffusion_step = kwargs['model'].get('max_diffusion_step')
+            num_rnn_layers = kwargs['model'].get('num_rnn_layers')
+            rnn_units = kwargs['model'].get('rnn_units')
+            structure = '-'.join(
+                ['%d' % rnn_units for _ in range(num_rnn_layers)])
+            horizon = kwargs['model'].get('horizon')
+            filter_type = kwargs['model'].get('filter_type')
+            filter_type_abbr = 'L'
+            if filter_type == 'random_walk':
+                filter_type_abbr = 'R'
+            elif filter_type == 'dual_random_walk':
+                filter_type_abbr = 'DR'
+            run_id = 'dcrnn_%s_%d_h_%d_%s_lr_%g_bs_%d_%s/' % (
+                filter_type_abbr, max_diffusion_step, horizon,
+                structure, learning_rate, batch_size,
+                time.strftime('%m%d%H%M%S'))
+            base_dir = kwargs.get('base_dir')
+            log_dir = os.path.join(base_dir, run_id)
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir)
+        return log_dir
+
 class Decoder(nn.Module):
     def __init__(self, latent_dim, future_steps):
         super(Decoder, self).__init__()
@@ -154,13 +202,13 @@ class Decoder(nn.Module):
         return self.out(z)
 
 class VAE(nn.Module):
-    def __init__(self, input_dim, lstm_output_dim, gcn_output_dim, latent_dim, future_steps, beta=0.001, 
-                 use_d_knn=True, use_gcn=True, use_gpd=True, use_bernoulli=True):
+    def __init__(self, adj_mx, latent_dim, future_steps, beta=0.001, 
+                 use_d_knn=True, use_gpd=True, use_bernoulli=True, **dcrnn_kwargs):
         super(VAE, self).__init__()
         
         # Module on/off flags
         self.use_d_knn = use_d_knn
-        self.use_gcn = use_gcn
+        # self.use_gcn = use_gcn
         self.use_gpd = use_gpd
         self.use_bernoulli = use_bernoulli
 
@@ -168,7 +216,7 @@ class VAE(nn.Module):
         if self.use_d_knn:
             self.d_knn = D_KNN(k=3, tau=1.0)  # D-KNN Imputation
 
-        self.encoder = LSTM_GCN_Encoder(input_dim, lstm_output_dim, gcn_output_dim, latent_dim, use_gcn, use_gpd, use_bernoulli)
+        self.encoder = LSTM_GCN_Encoder(adj_mx, latent_dim, use_gpd, use_bernoulli, **dcrnn_kwargs)
         self.decoder = Decoder(latent_dim, future_steps)
         self.beta = beta
         
@@ -208,13 +256,13 @@ class VAE(nn.Module):
         
         return z
 
-    def forward(self, x_full, x_missing=None, edge_index=None):
+    def forward(self, x_full, y, x_missing=None, batches_seen=None):
         if self.use_d_knn and x_missing is not None:
             x_imputed = self.d_knn(x_full, x_full, x_missing)
         else:
             x_imputed = x_full  # Nếu không dùng D-KNN, giữ nguyên x_full
 
-        z_mean_normal, z_log_var_normal, z_scale_extreme, z_shape_extreme, z_logits_zero = self.encoder(x_imputed, edge_index)
+        z_mean_normal, z_log_var_normal, z_scale_extreme, z_shape_extreme, z_logits_zero = self.encoder(x_imputed, y, batches_seen)
         z = self.reparameterize(z_mean_normal, z_log_var_normal, z_scale_extreme, z_shape_extreme, z_logits_zero)
         reconstructed = self.decoder(z)
         return reconstructed, z_mean_normal, z_log_var_normal, z_scale_extreme, z_shape_extreme, z_logits_zero
