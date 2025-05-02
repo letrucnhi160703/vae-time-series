@@ -91,7 +91,7 @@ def main(args):
 
         vae = VAE(adj_mx=adj_mx, latent_dim=args.latent_dim, future_steps=args.predict_steps, 
                   use_d_knn=args.use_d_knn, use_gpd=args.use_gpd, use_bernoulli=args.use_bernoulli, 
-                  **supervisor_config)
+                  **supervisor_config).to(device)
 
         train_iterator = _data['train_loader'].get_iterator()
 
