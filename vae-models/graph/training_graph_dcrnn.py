@@ -12,6 +12,8 @@ import yaml
 from utils import load_graph_data
 from utils import load_dataset
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 # def parse_args():
 #     parser = argparse.ArgumentParser(description="Train VAE model with different hyperparameters.")
     
@@ -68,7 +70,7 @@ def _get_x_y_in_correct_dims(x, y, seq_len, batch_size, num_nodes, input_dim, ho
 def _prepare_data(x, y, seq_len, batch_size, num_nodes, input_dim, horizon, output_dim):
         x, y = _get_x_y(x, y)
         x, y = _get_x_y_in_correct_dims(x, y, seq_len, batch_size, num_nodes, input_dim, horizon, output_dim)
-        return x, y
+        return x.to(device), y.to(device)
 
 def main(args):
     with open(args.config_filename) as f:
@@ -160,6 +162,7 @@ if __name__ == "__main__":
     parser.add_argument('--config_filename', default=None, type=str,
                         help='Configuration filename for restoring the model.')
     parser.add_argument('--use_cpu_only', default=True, type=bool, help='Set to true to only use cpu.')
+    
     parser.add_argument("--file_path", type=str, default='../../datasets/LD2011_2014_less.csv', help="Path to the dataset file")
     parser.add_argument("--window_length", type=int, default=12, help="Window length for sliding window")
     parser.add_argument("--predict_steps", type=int, default=1, help="Number of steps to predict")
