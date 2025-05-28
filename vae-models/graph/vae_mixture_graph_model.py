@@ -87,10 +87,10 @@ class LSTM_GCN_Encoder(nn.Module):
         self._kwargs = dcrnn_kwargs
         self._model_kwargs = dcrnn_kwargs.get('model')
 
-        self._log_dir = self._get_log_dir(dcrnn_kwargs)
-        self._writer = SummaryWriter('runs/' + self._log_dir)
-        log_level = self._kwargs.get('log_level', 'INFO')
-        self._logger = get_logger(self._log_dir, __name__, 'info.log', level=log_level)
+        # self._log_dir = self._get_log_dir(dcrnn_kwargs)
+        # self._writer = SummaryWriter('runs/' + self._log_dir)
+        # log_level = self._kwargs.get('log_level', 'INFO')
+        # self._logger = get_logger(self._log_dir, __name__, 'info.log', level=log_level)
         # # LSTM Layer
         # self.lstm = nn.LSTM(input_dim, lstm_output_dim, num_layers=3, batch_first=True)
         # self.layer_norm = nn.LayerNorm(lstm_output_dim)
@@ -103,8 +103,10 @@ class LSTM_GCN_Encoder(nn.Module):
         #     fc_input_dim = lstm_output_dim  # If not using GCN, input dim is LSTM output dim
 
         # DCRNN Layer
-        self.dcrnn = DCRNNModel(adj_mx, self._logger, **self._model_kwargs)
+        self.dcrnn = DCRNNModel(adj_mx, **self._model_kwargs)
         dcrnn_output_dim = self._model_kwargs['num_nodes'] * self._model_kwargs['output_dim']
+        # print("DCRNN output dim: ", dcrnn_output_dim)
+        num_nodes = self._model_kwargs['num_nodes']
 
         fc_input_dim = dcrnn_output_dim
 
@@ -114,29 +116,29 @@ class LSTM_GCN_Encoder(nn.Module):
         self.dropout = nn.Dropout(0.3)
 
         # Gaussian parameters
-        self.mean_layer_normal = nn.Linear(64, latent_dim)
-        self.logvar_layer_normal = nn.Linear(64, latent_dim)
+        self.mean_layer_normal = nn.Linear(64, latent_dim*num_nodes)
+        self.logvar_layer_normal = nn.Linear(64, latent_dim*num_nodes)
 
         # GPD parameters
         if self.use_gpd:
-            self.scale_layer_extreme = nn.Linear(64, latent_dim)
-            self.shape_layer_extreme = nn.Linear(64, latent_dim)
+            self.scale_layer_extreme = nn.Linear(64, latent_dim*num_nodes)
+            self.shape_layer_extreme = nn.Linear(64, latent_dim*num_nodes)
 
         # Bernoulli parameter
         if self.use_bernoulli:
-            self.logits_layer_zero = nn.Linear(64, latent_dim)
+            self.logits_layer_zero = nn.Linear(64, latent_dim*num_nodes)
 
-    def forward(self, x, y, batches_seen=None):
+    def forward(self, x, y=None, batches_seen=None):
+        # print("##########", x.shape)
         # _, (h_n, _) = self.lstm(x)
         # h_n = self.layer_norm(h_n[-1])  # Take the last hidden state
 
         # if self.use_gcn:
         #     h_n = self.gcn(h_n, edge_index)
 
-        x = x.transpose(0, 1)
+        # x = x.transpose(0, 1)
         dcrnn_output = self.dcrnn(x, y, batches_seen)
 
-        # Lấy output cuối cùng từ chuỗi dự đoán
         h_n = dcrnn_output[-1]  # Shape: (batch_size, num_nodes * output_dim)
 
         # FC Layers
@@ -189,17 +191,21 @@ class LSTM_GCN_Encoder(nn.Module):
         return log_dir
 
 class Decoder(nn.Module):
-    def __init__(self, latent_dim, future_steps):
+    def __init__(self, latent_dim, future_steps, num_nodes):
         super(Decoder, self).__init__()
-        self.fc1 = nn.Linear(latent_dim, 128)
+        self.future_steps = future_steps
+        self.num_nodes = num_nodes
+        self.fc1 = nn.Linear(latent_dim*num_nodes, 128)
         self.fc2 = nn.Linear(128, 500)
         self.dropout = nn.Dropout(0.3)
-        self.out = nn.Linear(500, future_steps)
+        self.out = nn.Linear(500, future_steps*num_nodes)
 
     def forward(self, z):
+        # print("Z shape: ", z.shape)
         z = F.relu(self.fc1(z))
         z = self.dropout(F.relu(self.fc2(z)))
-        return self.out(z)
+        output = self.out(z)
+        return output.view(-1, self.future_steps, self.num_nodes).permute(1, 0, 2)
 
 class VAE(nn.Module):
     def __init__(self, adj_mx, latent_dim, future_steps, beta=0.001, 
@@ -217,7 +223,10 @@ class VAE(nn.Module):
             self.d_knn = D_KNN(k=3, tau=1.0)  # D-KNN Imputation
 
         self.encoder = LSTM_GCN_Encoder(adj_mx, latent_dim, use_gpd, use_bernoulli, **dcrnn_kwargs)
-        self.decoder = Decoder(latent_dim, future_steps)
+
+        model_kwargs = dcrnn_kwargs.get('model')
+        num_nodes = model_kwargs['num_nodes']
+        self.decoder = Decoder(latent_dim, future_steps, num_nodes)
         self.beta = beta
         
         if self.use_gpd and self.use_bernoulli:
@@ -231,7 +240,7 @@ class VAE(nn.Module):
         z_gaussian = reparameterize_gaussian(z_mean_normal, z_log_var_normal)
 
         if not self.use_gpd and not self.use_bernoulli:
-            return z_gaussian  # Trả về Gaussian nếu không dùng GPD/Bernoulli
+            return z_gaussian  # Tráº£ vá» Gaussian náº¿u khÃ´ng dÃ¹ng GPD/Bernoulli
 
         z_gpd = reparameterize_gpd(z_scale_extreme, z_shape_extreme, z_mean_normal.size()) if self.use_gpd else torch.zeros_like(z_mean_normal)
         z_bernoulli = reparameterize_bernoulli(z_logits_zero) if self.use_bernoulli else torch.zeros_like(z_mean_normal)
@@ -256,12 +265,13 @@ class VAE(nn.Module):
         
         return z
 
-    def forward(self, x_full, y, x_missing=None, batches_seen=None):
+    def forward(self, x_full, y=None, x_missing=None, batches_seen=None):
         if self.use_d_knn and x_missing is not None:
             x_imputed = self.d_knn(x_full, x_full, x_missing)
         else:
-            x_imputed = x_full  # Nếu không dùng D-KNN, giữ nguyên x_full
-
+            x_imputed = x_full  
+            
+        # print("##########", x_imputed.shape)
         z_mean_normal, z_log_var_normal, z_scale_extreme, z_shape_extreme, z_logits_zero = self.encoder(x_imputed, y, batches_seen)
         z = self.reparameterize(z_mean_normal, z_log_var_normal, z_scale_extreme, z_shape_extreme, z_logits_zero)
         reconstructed = self.decoder(z)
@@ -295,12 +305,12 @@ class VAE(nn.Module):
         # GPD Loss
         Loss_gpd = 0
         if self.use_gpd:
-            extreme_mask = extreme_mask.squeeze(-1) # Làm phẳng mask
-            y_extreme = y[extreme_mask] # Lọc ra giá trị cực đoan
+            extreme_mask = extreme_mask.squeeze(-1) # LÃ m pháº³ng mask
+            y_extreme = y[extreme_mask] # Lá»c ra giÃ¡ trá»‹ cá»±c Ä‘oan
             if y_extreme.numel() != 0:
-                scale_extreme = z_scale_extreme[extreme_mask] # Lọc scale
-                shape_extreme = z_shape_extreme[extreme_mask] # Lọc shape
-                excess = y_extreme - threshold # Tính y_i - u
+                scale_extreme = z_scale_extreme[extreme_mask] # Lá»c scale
+                shape_extreme = z_shape_extreme[extreme_mask] # Lá»c shape
+                excess = y_extreme - threshold # TÃ­nh y_i - u
                 gpd_nll = torch.mean(torch.log(scale_extreme) + (1 + 1 / shape_extreme) * torch.log(1 + shape_extreme * excess / scale_extreme))
                 # print('Scale extreme:', scale_extreme)
                 # print('Shape extreme:', shape_extreme)

@@ -95,14 +95,14 @@ class DecoderModel(nn.Module, Seq2SeqAttrs):
 
 
 class DCRNNModel(nn.Module, Seq2SeqAttrs):
-    def __init__(self, adj_mx, logger, **model_kwargs):
+    def __init__(self, adj_mx, **model_kwargs):
         super().__init__()
         Seq2SeqAttrs.__init__(self, adj_mx, **model_kwargs)
         self.encoder_model = EncoderModel(adj_mx, **model_kwargs)
         self.decoder_model = DecoderModel(adj_mx, **model_kwargs)
         self.cl_decay_steps = int(model_kwargs.get('cl_decay_steps', 1000))
         self.use_curriculum_learning = bool(model_kwargs.get('use_curriculum_learning', False))
-        self._logger = logger
+        # self._logger = logger
 
     def _compute_sampling_threshold(self, batches_seen):
         return self.cl_decay_steps / (
@@ -156,12 +156,14 @@ class DCRNNModel(nn.Module, Seq2SeqAttrs):
         :param batches_seen: batches seen till now
         :return: output: (self.horizon, batch_size, self.num_nodes * self.output_dim)
         """
+           
+        # print("Input Shape: ", inputs.shape)
         encoder_hidden_state = self.encoder(inputs)
-        self._logger.debug("Encoder complete, starting decoder")
+        # self._logger.debug("Encoder complete, starting decoder")
         outputs = self.decoder(encoder_hidden_state, labels, batches_seen=batches_seen)
-        self._logger.debug("Decoder complete")
-        if batches_seen == 0:
-            self._logger.info(
-                "Total trainable parameters {}".format(count_parameters(self))
-            )
+        # self._logger.debug("Decoder complete")
+        # if batches_seen == 0:
+        #     self._logger.info(
+        #         "Total trainable parameters {}".format(count_parameters(self))
+        #     )
         return outputs
