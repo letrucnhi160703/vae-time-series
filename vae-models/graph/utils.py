@@ -186,10 +186,19 @@ def load_dataset(dataset_dir, batch_size, test_batch_size=None, **kwargs):
     for category in ['train', 'val', 'test']:
         data['x_' + category][..., 0] = scaler.transform(data['x_' + category][..., 0])
         data['y_' + category][..., 0] = scaler.transform(data['y_' + category][..., 0])
+
+    # ===== Threshold over all nodes & channels =====
+    y_train_shape = data['y_train'].shape  # (N, T, num_nodes, input_dim)
+    y_train_reshaped = data['y_train'].reshape(-1, y_train_shape[-1])  # (N * T * num_nodes, input_dim)
+    y_train_original = scaler.inverse_transform(y_train_reshaped)  # shape: (total_points, input_dim)
+    y_train_flat = y_train_original.flatten()
+    threshold = np.percentile(y_train_flat, kwargs['percentile'])
+
     data['train_loader'] = DataLoader(data['x_train'], data['y_train'], batch_size, shuffle=True)
     data['val_loader'] = DataLoader(data['x_val'], data['y_val'], test_batch_size, shuffle=False)
     data['test_loader'] = DataLoader(data['x_test'], data['y_test'], test_batch_size, shuffle=False)
     data['scaler'] = scaler
+    data['threshold'] = threshold
 
     return data
 

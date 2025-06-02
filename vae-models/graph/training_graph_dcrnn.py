@@ -125,7 +125,8 @@ def main(args):
                 if batches_seen == 0:
                     optimizer = torch.optim.Adam(vae.parameters(), lr=args.lr)
 
-                loss = vae.loss_function(forecasting, y, z_mean_normal, z_log_var_normal, z_scale_extreme, z_shape_extreme, z_logits_zero)
+                loss = vae.loss_function(forecasting, y, z_mean_normal, z_log_var_normal, _data['threshold'],
+                                         z_scale_extreme, z_shape_extreme, z_logits_zero)
 
                 batches_seen += 1
 

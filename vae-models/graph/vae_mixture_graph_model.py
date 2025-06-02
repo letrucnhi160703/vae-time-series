@@ -10,6 +10,8 @@ from torch.utils.tensorboard import SummaryWriter
 import os
 import time
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 # Gaussian reparameterization function
 def reparameterize_gaussian(mean, logvar):
     std = torch.exp(0.5 * logvar)
@@ -18,7 +20,7 @@ def reparameterize_gaussian(mean, logvar):
 
 # Custom GPD reparameterization function
 def reparameterize_gpd(scale, shape, size):
-    uniform_sample = torch.rand(size)
+    uniform_sample = torch.rand(size).to(device)
     return scale / shape * ((1 - uniform_sample) ** (-shape) - 1)
 
 # Bernoulli sampling function
@@ -245,7 +247,7 @@ class VAE(nn.Module):
         z_gpd = reparameterize_gpd(z_scale_extreme, z_shape_extreme, z_mean_normal.size()) if self.use_gpd else torch.zeros_like(z_mean_normal)
         z_bernoulli = reparameterize_bernoulli(z_logits_zero) if self.use_bernoulli else torch.zeros_like(z_mean_normal)
 
-        choice = torch.rand(z_mean_normal.size(0))
+        choice = torch.rand(z_mean_normal.size(0)).to(device)
         z = torch.empty_like(z_mean_normal)
 
         probs = F.softmax(self.pi_params, dim=0)
@@ -277,7 +279,7 @@ class VAE(nn.Module):
         reconstructed = self.decoder(z)
         return reconstructed, z_mean_normal, z_log_var_normal, z_scale_extreme, z_shape_extreme, z_logits_zero
 
-    def loss_function(self, reconstructed, y, z_mean_normal, z_log_var_normal, threshold, z_scale_extreme=None, z_shape_extreme=None, z_logits_zero=None, x_full=None, x_missing=None):
+    def loss_function(self, reconstructed, y, z_mean_normal, z_log_var_normal, threshold=None, z_scale_extreme=None, z_shape_extreme=None, z_logits_zero=None, x_full=None, x_missing=None):
         # If not using GPD or Bernoulli, return Gaussian loss
         if not self.use_gpd and not self.use_bernoulli and not self.use_d_knn:
             R_gaussian = F.mse_loss(reconstructed, y, reduction='mean')
