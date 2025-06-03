@@ -9,6 +9,7 @@ from utils import get_logger
 from torch.utils.tensorboard import SummaryWriter
 import os
 import time
+from dknn.non_local import N3AggregationBase
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -59,27 +60,52 @@ def classify_observations(y, threshold, use_gpd=True, use_bernoulli=True):
 
 # Differentiable KNN
 class D_KNN(nn.Module):
-    def __init__(self, k=3, tau=1.0):
-        super(D_KNN, self).__init__()
+    def __init__(self, k=7, temp_opt={}, **dcrnn_kwargs):
+        super().__init__()
         self.k = k
-        self.tau = tau
+        self.n3_block = N3AggregationBase(k=k, temp_opt=temp_opt)
+        self.dcrnn_kwargs = dcrnn_kwargs
 
-    def soft_knn_weights(self, X, query):
-        distances = torch.cdist(query.unsqueeze(0), X)  #Calculate Euclidean distances
-        weights = F.softmax(-distances / self.tau, dim=1)  # Softmax to get weights
-        return weights
+    def forward(self, x, mask_missing=None):
+        """
+        x: tensor shape (seq_len, batch_size, num_nodes * input_dim)
+        mask_missing: bool tensor shape (seq_len, batch_size, num_nodes, input_dim),
+                      True nếu vị trí đó missing cần impute
+                      Nếu None thì mặc định không biết vị trí missing
+        """
 
-    def forward(self, X_train, y_train, X_missing):
-        weights = self.soft_knn_weights(X_train, X_missing)
-        topk_values, topk_indices = torch.topk(weights, self.k, dim=1)  # Choose top K weights
-        topk_labels = y_train[topk_indices.squeeze()]  # Choose top K labels
+        # batch_size, num_nodes, feat_dim = x.shape
+        model_kwargs = self.dcrnn_kwargs.get('model')
+        data_kwargs = self.dcrnn_kwargs.get('data')
+        num_nodes = model_kwargs['num_nodes']
+        batch_size = data_kwargs['batch_size']
 
-        # Impute missing values using top K labels and weights
-        imputed_values = torch.sum(topk_labels * topk_values.unsqueeze(-1), dim=1)
-        return imputed_values
+        # 1. Tạo embedding cho nodes (ở đây đơn giản lấy chính x làm embedding)
+        xe = x  # database embedding
+        ye = x  # query embedding
+
+        # 2. Tạo chỉ số candidate neighbors: ở đây lấy toàn bộ nodes làm candidates
+        I = torch.arange(num_nodes).unsqueeze(0).unsqueeze(0).repeat(batch_size, num_nodes, 1).to(x.device)
+
+        # 3. Tính neighbor features (shape: batch_size, num_nodes, feature_dim, k)
+        neighbor_feats = self.n3_block(x, xe, ye, I)  # lấy weighted neighbors
+
+        # 4. Tổng hợp neighbors bằng trung bình theo k
+        neighbor_agg = neighbor_feats.mean(dim=-1)  # shape: (batch_size, num_nodes, feature_dim)
+
+        # 5. Impute dữ liệu missing bằng neighbor aggregation tại vị trí missing
+        if mask_missing is not None:
+            # giữ giá trị gốc cho vị trí không missing
+            x_imputed = x.clone()
+            x_imputed[mask_missing] = neighbor_agg[mask_missing]
+        else:
+            # Nếu không có mask, trả về neighbor aggregated toàn bộ
+            x_imputed = neighbor_agg
+
+        return x_imputed
 
 class LSTM_GCN_Encoder(nn.Module):
-    def __init__(self, adj_mx, latent_dim, use_gpd=True, use_bernoulli=True, **dcrnn_kwargs):
+    def __init__(self, adj_mx, latent_dim, use_gpd=True, use_bernoulli=True, use_dknn=False, **dcrnn_kwargs):
         super(LSTM_GCN_Encoder, self).__init__()
 
         # Module on/off flags
@@ -143,12 +169,16 @@ class LSTM_GCN_Encoder(nn.Module):
 
         h_n = dcrnn_output[-1]  # Shape: (batch_size, num_nodes * output_dim)
 
+        # print("h_n shape: ", h_n.shape)
+
         # FC Layers
         hidden = F.relu(self.fc1(h_n))
         hidden = self.dropout(F.relu(self.fc2(hidden)))
 
         z_mean_normal = self.mean_layer_normal(hidden)
         z_log_var_normal = self.logvar_layer_normal(hidden)
+
+        # print("z_mean_normal shape: ", z_mean_normal.shape)
 
         if self.use_gpd:
             z_scale_extreme = torch.exp(self.scale_layer_extreme(hidden))
@@ -193,21 +223,24 @@ class LSTM_GCN_Encoder(nn.Module):
         return log_dir
 
 class Decoder(nn.Module):
-    def __init__(self, latent_dim, future_steps, num_nodes):
+    def __init__(self, latent_dim, future_steps, num_nodes, output_dim):
         super(Decoder, self).__init__()
         self.future_steps = future_steps
         self.num_nodes = num_nodes
+        self.output_dim = output_dim
         self.fc1 = nn.Linear(latent_dim*num_nodes, 128)
         self.fc2 = nn.Linear(128, 500)
         self.dropout = nn.Dropout(0.3)
-        self.out = nn.Linear(500, future_steps*num_nodes)
+        self.out = nn.Linear(500, future_steps*num_nodes*output_dim)
 
     def forward(self, z):
         # print("Z shape: ", z.shape)
         z = F.relu(self.fc1(z))
         z = self.dropout(F.relu(self.fc2(z)))
         output = self.out(z)
-        return output.view(-1, self.future_steps, self.num_nodes).permute(1, 0, 2)
+        output = output.view(-1, self.future_steps, self.num_nodes*self.output_dim).permute(1, 0, 2)
+        print("Output shape: ", output.shape)
+        return output
 
 class VAE(nn.Module):
     def __init__(self, adj_mx, latent_dim, future_steps, beta=0.001, 
@@ -222,13 +255,13 @@ class VAE(nn.Module):
 
         # Init modules if flags are on
         if self.use_d_knn:
-            self.d_knn = D_KNN(k=3, tau=1.0)  # D-KNN Imputation
+            self.d_knn = D_KNN(k=3, tau=1.0, dcrnn_kwargs=dcrnn_kwargs)  # D-KNN Imputation
 
         self.encoder = LSTM_GCN_Encoder(adj_mx, latent_dim, use_gpd, use_bernoulli, **dcrnn_kwargs)
 
         model_kwargs = dcrnn_kwargs.get('model')
         num_nodes = model_kwargs['num_nodes']
-        self.decoder = Decoder(latent_dim, future_steps, num_nodes)
+        self.decoder = Decoder(latent_dim, future_steps, num_nodes, output_dim=model_kwargs['output_dim'])
         self.beta = beta
         
         if self.use_gpd and self.use_bernoulli:
@@ -269,13 +302,14 @@ class VAE(nn.Module):
 
     def forward(self, x_full, y=None, x_missing=None, batches_seen=None):
         if self.use_d_knn and x_missing is not None:
-            x_imputed = self.d_knn(x_full, x_full, x_missing)
+            x_imputed = self.d_knn(x=x_full, mask_missing=x_missing)
         else:
             x_imputed = x_full  
             
         # print("##########", x_imputed.shape)
         z_mean_normal, z_log_var_normal, z_scale_extreme, z_shape_extreme, z_logits_zero = self.encoder(x_imputed, y, batches_seen)
         z = self.reparameterize(z_mean_normal, z_log_var_normal, z_scale_extreme, z_shape_extreme, z_logits_zero)
+        # print("Z shape: ", z.shape)
         reconstructed = self.decoder(z)
         return reconstructed, z_mean_normal, z_log_var_normal, z_scale_extreme, z_shape_extreme, z_logits_zero
 
@@ -337,8 +371,11 @@ class VAE(nn.Module):
         # D-KNN Loss
         Loss_d_knn = 0
         if self.use_d_knn and x_missing is not None:
-            x_imputed = self.d_knn(x_full, x_full, x_missing)
-            Loss_d_knn = 0.1 * F.mse_loss(x_imputed, x_missing, reduction='mean')
+            # x_imputed = self.d_knn(x_full, x_full, x_missing)
+            # Loss_d_knn = 0.1 * F.mse_loss(x_imputed, x_missing, reduction='mean')
+            x_imputed = self.d_knn(x_full, mask_missing=x_missing)
+            # Loss giữa giá trị điền và giá trị thật tại vị trí missing
+            Loss_d_knn = 0.1 * F.mse_loss(x_imputed[x_missing], x_full[x_missing], reduction='mean')
 
         # print ("Loss_bernoulli: ", Loss_bernoulli)
         total_loss = Loss_gaussian + Loss_gpd + Loss_bernoulli + Loss_d_knn
