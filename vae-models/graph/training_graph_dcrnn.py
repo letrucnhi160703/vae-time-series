@@ -62,27 +62,24 @@ def masked_mae_loss(y_pred, y_true):
     loss[loss != loss] = 0
     return loss.mean()
 
-def create_mask_missing_feature0_node0(x, input_dim, num_nodes):
-    """
-    x: tensor shape (seq_len, batch_size, num_nodes * input_dim)
-    return:
-      mask_missing: bool tensor shape (seq_len, batch_size, num_nodes, input_dim)
-      x_masked: x đã gán giá trị missing (0) cho feature đầu tiên node đầu tiên
-    """
-    seq_len, batch_size, _ = x.shape
+def create_mask_missing_nodes(x, seq_len, batch_size, num_nodes, input_dim, missing_percent=20):
+    mask_missing = torch.zeros((seq_len, batch_size, num_nodes, input_dim), dtype=torch.bool, device=x.device)
+
+    num_missing_nodes = int((missing_percent / 100) * num_nodes)
+
+    for t in range(seq_len):
+        for b in range(batch_size):
+            missing_idx = torch.randperm(num_nodes)[:num_missing_nodes]
+            mask_missing[t, b, missing_idx, :] = True  # Mark all features of those nodes as missing
+
+    # Apply mask to x
     x_reshaped = x.view(seq_len, batch_size, num_nodes, input_dim)
-
-    mask_missing = torch.zeros_like(x_reshaped, dtype=torch.bool)
-
-    # Gán mask True cho feature đầu tiên (index 0) của node đầu tiên (index 0)
-    mask_missing[:, :, 0, 0] = True
-
-    # Tạo bản copy của x_reshaped để gán giá trị missing (ví dụ 0)
-    x_masked = x_reshaped.clone()
-    x_masked[:, :, 0, 0] = 0.0  # Missing thì giá trị = 0
-    x_masked[:, :, 0, 0] = torch.nan  # Missing thì giá trị = NaN
-
-    return mask_missing, x_masked
+    x_with_missing = x_reshaped.clone()
+    x_with_missing[mask_missing] = float('nan')
+    x_with_missing = x_with_missing.view(seq_len, batch_size, num_nodes * input_dim)
+    mask_missing = mask_missing.view(seq_len, batch_size, num_nodes * input_dim)
+    
+    return mask_missing, x_with_missing
 
 
 def main(args):
@@ -110,9 +107,9 @@ def main(args):
         _data = load_dataset(**_data_kwargs)
         standard_scaler = _data['scaler']
 
-        vae = VAE(adj_mx=adj_mx, latent_dim=args.latent_dim, num_nodes=_model_kwargs.get('num_nodes'), future_steps=args.predict_steps, 
-                  use_d_knn=args.use_d_knn, use_gpd=args.use_gpd, use_bernoulli=args.use_bernoulli, 
-                  **supervisor_config).to(device)
+        vae = VAE(adj_mx=adj_mx, latent_dim=args.latent_dim, num_nodes=_model_kwargs.get('num_nodes'),
+                  future_steps=args.predict_steps, use_d_knn=args.use_d_knn, use_gpd=args.use_gpd,
+                  use_bernoulli=args.use_bernoulli, **supervisor_config).to(device)
 
         train_iterator = _data['train_loader'].get_iterator()
 
@@ -141,16 +138,20 @@ def main(args):
                                     _model_kwargs['horizon'], _model_kwargs['output_dim'])
                 # print(x.shape, y.shape)
 
-                mask_missing, x_with_missing = create_mask_missing_feature0_node0(x, input_dim=_model_kwargs['input_dim'], num_nodes=_model_kwargs['num_nodes'])
+                mask_missing, x_with_missing = create_mask_missing_nodes(x=x, seq_len=_model_kwargs['seq_len'], batch_size=_data_kwargs['batch_size'],
+                                                                        input_dim=_model_kwargs['input_dim'], num_nodes=_model_kwargs['num_nodes'],
+                                                                        missing_percent=10)
 
-                forecasting, z_mean_normal, z_log_var_normal, z_scale_extreme, z_shape_extreme, z_logits_zero = vae(x_full=x, y=y, x_missing=x, batches_seen=batches_seen)
+                forecasting, z_mean_normal, z_log_var_normal, z_scale_extreme,z_shape_extreme, z_logits_zero = vae(x_full=x, y=y, x_missing=x,
+                                                                                                                   mask_missing=mask_missing, batches_seen=batches_seen)
                 # print("Forecasting: ", forecasting.shape)
 
                 if batches_seen == 0:
                     optimizer = torch.optim.Adam(vae.parameters(), lr=args.lr)
 
                 loss = vae.loss_function(forecasting, y, z_mean_normal, z_log_var_normal, _data['threshold'],
-                                         z_scale_extreme, z_shape_extreme, z_logits_zero)
+                                         z_scale_extreme, z_shape_extreme, z_logits_zero,
+                                         x_full=x, x_missing=x_with_missing, mask_missing=mask_missing)
 
                 batches_seen += 1
 
@@ -176,7 +177,12 @@ def main(args):
             x, y = _prepare_data(x, y, _model_kwargs['seq_len'], _data_kwargs['batch_size'],
                                 _model_kwargs['num_nodes'], _model_kwargs['input_dim'],
                                 _model_kwargs['horizon'], _model_kwargs['output_dim'])
-            predictions, _, _, _, _, _ = vae(x, None, x, None)
+            
+            mask_missing, x_with_missing = create_mask_missing_nodes(x=x, seq_len=_model_kwargs['seq_len'], batch_size=_data_kwargs['batch_size'],
+                                                                        input_dim=_model_kwargs['input_dim'], num_nodes=_model_kwargs['num_nodes'],
+                                                                        missing_percent=10)
+            
+            predictions, _, _, _, _, _ = vae(x_full=x, y=None, x_missing=x, mask_missing= mask_missing, batches_seen=None)
 
             loss = _compute_loss(y, predictions, standard_scaler)
             losses.append(loss.item())

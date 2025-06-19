@@ -9,7 +9,8 @@ from utils import get_logger
 from torch.utils.tensorboard import SummaryWriter
 import os
 import time
-from dknn.non_local import N3AggregationBase
+from dknn.non_local import N3AggregationBase, index_neighbours
+from dknn.ops import im2patch
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -64,7 +65,10 @@ class D_KNN(nn.Module):
         super().__init__()
         self.k = k
         self.n3_block = N3AggregationBase(k=k, temp_opt=temp_opt)
-        self.dcrnn_kwargs = dcrnn_kwargs
+        self._model_kwargs = dcrnn_kwargs.get('model')
+        self._data_kwargs = dcrnn_kwargs.get('data')
+        self.num_nodes = self._model_kwargs['num_nodes']
+        self.batch_size = self._data_kwargs['batch_size']
 
     def forward(self, x, mask_missing=None):
         """
@@ -75,18 +79,20 @@ class D_KNN(nn.Module):
         """
 
         # batch_size, num_nodes, feat_dim = x.shape
-        model_kwargs = self.dcrnn_kwargs.get('model')
-        data_kwargs = self.dcrnn_kwargs.get('data')
-        num_nodes = model_kwargs['num_nodes']
-        batch_size = data_kwargs['batch_size']
 
         # 1. Tạo embedding cho nodes (ở đây đơn giản lấy chính x làm embedding)
         xe = x  # database embedding
         ye = x  # query embedding
 
-        # 2. Tạo chỉ số candidate neighbors: ở đây lấy toàn bộ nodes làm candidates
-        I = torch.arange(num_nodes).unsqueeze(0).unsqueeze(0).repeat(batch_size, num_nodes, 1).to(x.device)
+        print("xe shape: ", xe.shape)
+        print("ye shape: ", ye.shape)
 
+        # 2. Tạo chỉ số candidate neighbors: ở đây lấy toàn bộ nodes làm candidates
+        # I = torch.arange(self.num_nodes).unsqueeze(0).unsqueeze(0).repeat(self.num_nodes, 1, self.batch_size).to(x.device)
+        I = index_neighbours(xe, ye, s=3, exclude_self=True).to(x.device)
+
+        print("I shape: ", I.shape)
+        
         # 3. Tính neighbor features (shape: batch_size, num_nodes, feature_dim, k)
         neighbor_feats = self.n3_block(x, xe, ye, I)  # lấy weighted neighbors
 
@@ -95,9 +101,12 @@ class D_KNN(nn.Module):
 
         # 5. Impute dữ liệu missing bằng neighbor aggregation tại vị trí missing
         if mask_missing is not None:
-            # giữ giá trị gốc cho vị trí không missing
+            # Dữ liệu missing là toàn bộ node, giữ nguyên giá trị gốc cho các node không missing
             x_imputed = x.clone()
-            x_imputed[mask_missing] = neighbor_agg[mask_missing]
+            
+            # mask_missing có shape (seq_len, batch_size, num_nodes, input_dim)
+            # với mỗi node bị missing hoàn toàn, ta impute toàn bộ feature
+            x_imputed[mask_missing] = neighbor_agg[mask_missing]  # Impute tất cả features cho node bị missing
         else:
             # Nếu không có mask, trả về neighbor aggregated toàn bộ
             x_imputed = neighbor_agg
@@ -223,15 +232,16 @@ class LSTM_GCN_Encoder(nn.Module):
         return log_dir
 
 class Decoder(nn.Module):
-    def __init__(self, latent_dim, future_steps, num_nodes, output_dim):
+    def __init__(self, latent_dim, future_steps, **dcrnn_kwargs):
         super(Decoder, self).__init__()
         self.future_steps = future_steps
-        self.num_nodes = num_nodes
-        self.output_dim = output_dim
-        self.fc1 = nn.Linear(latent_dim*num_nodes, 128)
+        self._model_kwargs = dcrnn_kwargs.get('model')
+        self.num_nodes = self._model_kwargs['num_nodes']
+        self.output_dim = self._model_kwargs['output_dim']
+        self.fc1 = nn.Linear(latent_dim*self.num_nodes, 128)
         self.fc2 = nn.Linear(128, 500)
         self.dropout = nn.Dropout(0.3)
-        self.out = nn.Linear(500, future_steps*num_nodes*output_dim)
+        self.out = nn.Linear(500, future_steps*self.num_nodes*self.output_dim)
 
     def forward(self, z):
         # print("Z shape: ", z.shape)
@@ -255,13 +265,13 @@ class VAE(nn.Module):
 
         # Init modules if flags are on
         if self.use_d_knn:
-            self.d_knn = D_KNN(k=3, tau=1.0, dcrnn_kwargs=dcrnn_kwargs)  # D-KNN Imputation
+            self.d_knn = D_KNN(k=3, temp_opt={"external_temp": True,
+                                              "temp_bias": 0.1, "distance_bn": True,
+                                              "no_avgpool": True}, **dcrnn_kwargs)  # D-KNN Imputation
 
         self.encoder = LSTM_GCN_Encoder(adj_mx, latent_dim, use_gpd, use_bernoulli, **dcrnn_kwargs)
 
-        model_kwargs = dcrnn_kwargs.get('model')
-        num_nodes = model_kwargs['num_nodes']
-        self.decoder = Decoder(latent_dim, future_steps, num_nodes, output_dim=model_kwargs['output_dim'])
+        self.decoder = Decoder(latent_dim, future_steps, **dcrnn_kwargs)
         self.beta = beta
         
         if self.use_gpd and self.use_bernoulli:
@@ -300,9 +310,9 @@ class VAE(nn.Module):
         
         return z
 
-    def forward(self, x_full, y=None, x_missing=None, batches_seen=None):
-        if self.use_d_knn and x_missing is not None:
-            x_imputed = self.d_knn(x=x_full, mask_missing=x_missing)
+    def forward(self, x_full, y=None, x_missing=None, mask_missing=None, batches_seen=None):
+        if self.use_d_knn:
+            x_imputed = self.d_knn(x=x_missing, mask_missing=mask_missing)
         else:
             x_imputed = x_full  
             
@@ -313,7 +323,9 @@ class VAE(nn.Module):
         reconstructed = self.decoder(z)
         return reconstructed, z_mean_normal, z_log_var_normal, z_scale_extreme, z_shape_extreme, z_logits_zero
 
-    def loss_function(self, reconstructed, y, z_mean_normal, z_log_var_normal, threshold=None, z_scale_extreme=None, z_shape_extreme=None, z_logits_zero=None, x_full=None, x_missing=None):
+    def loss_function(self, reconstructed, y, z_mean_normal, z_log_var_normal, threshold=None,
+                      z_scale_extreme=None, z_shape_extreme=None, z_logits_zero=None, x_full=None,
+                      x_missing=None, mask_missing=None):
         # If not using GPD or Bernoulli, return Gaussian loss
         if not self.use_gpd and not self.use_bernoulli and not self.use_d_knn:
             R_gaussian = F.mse_loss(reconstructed, y, reduction='mean')
@@ -373,7 +385,7 @@ class VAE(nn.Module):
         if self.use_d_knn and x_missing is not None:
             # x_imputed = self.d_knn(x_full, x_full, x_missing)
             # Loss_d_knn = 0.1 * F.mse_loss(x_imputed, x_missing, reduction='mean')
-            x_imputed = self.d_knn(x_full, mask_missing=x_missing)
+            x_imputed = self.d_knn(x_missing, mask_missing=mask_missing)
             # Loss giữa giá trị điền và giá trị thật tại vị trí missing
             Loss_d_knn = 0.1 * F.mse_loss(x_imputed[x_missing], x_full[x_missing], reduction='mean')
 

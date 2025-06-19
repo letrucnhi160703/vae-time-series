@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
 
-import ops
+from dknn.ops import indexed_matmul_1_efficient, euclidean_distance, indexed_matmul_2_efficient, im2patch, patch2im
 
 r"""
 Shape parameters: B -> batch size, N -> number of database items
@@ -42,6 +42,9 @@ def compute_distances(xe, ye, I, train=True):
     m = ye.shape[1]
     o = I.shape[2]
 
+    print('b,n, e:', b,n, e)
+    print('m, o:', m, o)
+
     if not train:
         # xe_ind -> b m o e
         If = I.view(b, m*o,1).expand(b,m*o,e)
@@ -49,7 +52,7 @@ def compute_distances(xe, ye, I, train=True):
         # D -> b m o
         ye = ye.unsqueeze(3)
 
-        D = -2*ops.indexed_matmul_1_efficient(xe, ye.squeeze(3), I).unsqueeze(3)
+        D = -2*indexed_matmul_1_efficient(xe, ye.squeeze(3), I).unsqueeze(3)
 
         xe_sqs = (xe**2).sum(dim=-1, keepdim=True)
         xe_sqs_ind = xe_sqs.gather(dim=1, index=If[:,:,0:1]).view(b,m,o,1)
@@ -59,7 +62,9 @@ def compute_distances(xe, ye, I, train=True):
         D = D.squeeze(3)
     else:
         # D_full -> b m n
-        D_full = ops.euclidean_distance(ye, xe.permute(0,2,1))
+        D_full = euclidean_distance(ye, xe.permute(0,2,1))
+        print("compute_distance D_full: ", D_full.shape)
+        print("compute_distance I: ", I.shape)
 
         # D -> b m o
         D = D_full.gather(dim=2, index=I)
@@ -86,7 +91,7 @@ def aggregate_output(W,x,I, train=True):
     k = W.shape[3]
     # print(b,m,o,k,f,n)
 
-    z = ops.indexed_matmul_2_efficient(x, W,I)
+    z = indexed_matmul_2_efficient(x, W,I)
 
     return z
 
@@ -123,12 +128,14 @@ class NeuralNearestNeighbors(nn.Module):
             distance_bn: Whether to put distances through a batchnorm layer
         """
         super(NeuralNearestNeighbors, self).__init__()
+        print("Temperature options:", temp_opt)
         self.external_temp = temp_opt.get("external_temp")
         self.log_temp_bias = log(temp_opt.get("temp_bias", 1))
         distance_bn = temp_opt.get("distance_bn")
 
         if not self.external_temp:
             self.log_temp = nn.Parameter(torch.FloatTensor(1).fill_(0.0))
+            print("log_temp:", self.log_temp)
         if distance_bn:
             self.bn = nn.BatchNorm1d(1)
         else:
@@ -141,14 +148,21 @@ class NeuralNearestNeighbors(nn.Module):
         if self.bn is not None:
             D = self.bn(D.view(b,1,m*o)).view(D.shape)
 
+        print("External_temp:", self.external_temp)
+        print("temp_bias:", self.log_temp_bias)
+        print("distance_bn:", self.bn)
+
         if self.external_temp:
             log_temp = log_temp.view(D.shape[0], D.shape[1], -1)
         else:
             log_temp = self.log_temp.view(1,1,1)
 
+        print("log_temp:", log_temp.shape, log_temp)
+
         log_temp = log_temp + self.log_temp_bias
 
         temperature = log_temp.exp()
+        print("temperature:", temperature.shape, temperature)
         if self.training:
             M = D.data > -float("Inf")
             if len(temperature) > 1:
@@ -209,9 +223,13 @@ class N3AggregationBase(nn.Module):
         # ye -> b m e
         # I  -> b m o
         b, n, f = x.shape
+        print("b, n, f:", b, n, f)
         m, e = ye.shape[1:]
+        print("b, m, e:", b, m, e)
         o = I.shape[2]
+        print("b, m, o:", b, m, o)
         k = self.k
+        print("k:", k)
 
         assert((b,n,e) == xe.shape)
         assert((b,m,e) == ye.shape)
@@ -269,13 +287,13 @@ class N3Aggregation2D(nn.Module):
             return y if y is not None else x
 
         # Convert everything to patches
-        x_patch, padding = ops.im2patch(x, self.patchsize, self.stride, None, returnpadding=True)
-        xe_patch = ops.im2patch(xe, self.patchsize, self.stride, self.padding)
+        x_patch, padding = im2patch(x, self.patchsize, self.stride, None, returnpadding=True)
+        xe_patch = im2patch(xe, self.patchsize, self.stride, self.padding)
         if y is None:
             y = x
             ye_patch = xe_patch
         else:
-            ye_patch = ops.im2patch(ye, self.patchsize, self.stride, self.padding)
+            ye_patch = im2patch(ye, self.patchsize, self.stride, self.padding)
 
         I = self.indexing(xe_patch, ye_patch)
         if not self.training:
@@ -293,7 +311,7 @@ class N3Aggregation2D(nn.Module):
         ye_patch = ye_patch.permute(0,4,5,1,2,3).contiguous().view(b,m,e)
 
         if log_temp is not None:
-            log_temp_patch = ops.im2patch(log_temp, self.patchsize, self.stride, self.padding)
+            log_temp_patch = im2patch(log_temp, self.patchsize, self.stride, self.padding)
             log_temp_patch = log_temp_patch.permute(0,4,5,2,3,1).contiguous().view(b,m,self.patchsize**2, log_temp.shape[1])
             if self.temp_opt["avgpool"]:
                 log_temp_patch = log_temp_patch.mean(dim=2)
@@ -308,7 +326,7 @@ class N3Aggregation2D(nn.Module):
         z_patch = z_patch.permute(0,1,3,2).contiguous().view(b,m1,m2,k*c,p1,p2).permute(0,3,4,5,1,2).contiguous()
 
         # Convert patches back to whole images
-        z = ops.patch2im(z_patch, self.patchsize, self.stride, padding)
+        z = patch2im(z_patch, self.patchsize, self.stride, padding)
 
         z = z.contiguous().view(b,k,c,H,W)
         z = z-y.view(b,1,c,H,W)
@@ -338,7 +356,7 @@ def index_neighbours(xe_patch, ye_patch, s, exclude_self=True):
 
     assert(m==n)
 
-    dev = xe_patch.get_device()
+    dev = xe_patch.device
     key = "{}_{}_{}_{}_{}_{}_{}".format(n1,n2,m1,m2,s,exclude_self, dev)
     if not key in index_neighbours_cache:
         I = torch.empty(1,m1*m2,o, device=dev, dtype=torch.int64)
