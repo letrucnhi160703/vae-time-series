@@ -9,6 +9,7 @@ from utils import get_logger
 from torch.utils.tensorboard import SummaryWriter
 import os
 import time
+from dknn.dknn_model import DKNNImputer3D
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -56,27 +57,6 @@ def classify_observations(y, threshold, use_gpd=True, use_bernoulli=True):
         return normal_mask, zero_mask
     else:
         return normal_mask
-
-# Differentiable KNN
-class D_KNN(nn.Module):
-    def __init__(self, k=3, tau=1.0):
-        super(D_KNN, self).__init__()
-        self.k = k
-        self.tau = tau
-
-    def soft_knn_weights(self, X, query):
-        distances = torch.cdist(query.unsqueeze(0), X)  #Calculate Euclidean distances
-        weights = F.softmax(-distances / self.tau, dim=1)  # Softmax to get weights
-        return weights
-
-    def forward(self, X_train, y_train, X_missing):
-        weights = self.soft_knn_weights(X_train, X_missing)
-        topk_values, topk_indices = torch.topk(weights, self.k, dim=1)  # Choose top K weights
-        topk_labels = y_train[topk_indices.squeeze()]  # Choose top K labels
-
-        # Impute missing values using top K labels and weights
-        imputed_values = torch.sum(topk_labels * topk_values.unsqueeze(-1), dim=1)
-        return imputed_values
 
 class LSTM_GCN_Encoder(nn.Module):
     def __init__(self, adj_mx, latent_dim, use_gpd=True, use_bernoulli=True, **dcrnn_kwargs):
@@ -211,7 +191,7 @@ class Decoder(nn.Module):
 
 class VAE(nn.Module):
     def __init__(self, adj_mx, latent_dim, future_steps, beta=0.001, 
-                 use_d_knn=True, use_gpd=True, use_bernoulli=True, **dcrnn_kwargs):
+                 use_d_knn=True, use_gpd=True, use_bernoulli=True, dknn_input_dim=1, num_available=0, **dcrnn_kwargs):
         super(VAE, self).__init__()
         
         # Module on/off flags
@@ -220,16 +200,21 @@ class VAE(nn.Module):
         self.use_gpd = use_gpd
         self.use_bernoulli = use_bernoulli
 
-        # Init modules if flags are on
-        if self.use_d_knn:
-            self.d_knn = D_KNN(k=3, tau=1.0)  # D-KNN Imputation
-
         self.encoder = LSTM_GCN_Encoder(adj_mx, latent_dim, use_gpd, use_bernoulli, **dcrnn_kwargs)
 
         model_kwargs = dcrnn_kwargs.get('model')
         num_nodes = model_kwargs['num_nodes']
         self.decoder = Decoder(latent_dim, future_steps, num_nodes)
         self.beta = beta
+
+        # Init modules if flags are on
+        if self.use_d_knn:
+            self.d_knn = DKNNImputer3D(
+            input_dim=dknn_input_dim,
+            t=1.0,
+            seq_len=model_kwargs['seq_len'],
+            available_node=num_available
+            ).to(device)  # D-KNN Imputation
         
         if self.use_gpd and self.use_bernoulli:
             self.pi_params = nn.Parameter(torch.tensor([3.0, 0.01, 0.01]))
@@ -267,19 +252,20 @@ class VAE(nn.Module):
         
         return z
 
-    def forward(self, x_full, y=None, x_missing=None, batches_seen=None):
-        if self.use_d_knn and x_missing is not None:
-            x_imputed = self.d_knn(x_full, x_full, x_missing)
-        else:
-            x_imputed = x_full  
+    def forward(self, x, y=None, batches_seen=None):
+        # if self.use_d_knn and x_missing is not None:
+        #     x_imputed = self.d_knn(x_missing)
+        # else:
+        #     x_imputed = x_full  
             
         # print("##########", x_imputed.shape)
-        z_mean_normal, z_log_var_normal, z_scale_extreme, z_shape_extreme, z_logits_zero = self.encoder(x_imputed, y, batches_seen)
+        z_mean_normal, z_log_var_normal, z_scale_extreme, z_shape_extreme, z_logits_zero = self.encoder(x, y, batches_seen)
         z = self.reparameterize(z_mean_normal, z_log_var_normal, z_scale_extreme, z_shape_extreme, z_logits_zero)
         reconstructed = self.decoder(z)
         return reconstructed, z_mean_normal, z_log_var_normal, z_scale_extreme, z_shape_extreme, z_logits_zero
 
-    def loss_function(self, reconstructed, y, z_mean_normal, z_log_var_normal, threshold=None, z_scale_extreme=None, z_shape_extreme=None, z_logits_zero=None, x_full=None, x_missing=None):
+    def loss_function(self, reconstructed, y, z_mean_normal, z_log_var_normal, threshold=None,
+                      z_scale_extreme=None, z_shape_extreme=None, z_logits_zero=None, x_full=None, x_imputed=None):
         # If not using GPD or Bernoulli, return Gaussian loss
         if not self.use_gpd and not self.use_bernoulli and not self.use_d_knn:
             R_gaussian = F.mse_loss(reconstructed, y, reduction='mean')
@@ -336,9 +322,8 @@ class VAE(nn.Module):
 
         # D-KNN Loss
         Loss_d_knn = 0
-        if self.use_d_knn and x_missing is not None:
-            x_imputed = self.d_knn(x_full, x_full, x_missing)
-            Loss_d_knn = 0.1 * F.mse_loss(x_imputed, x_missing, reduction='mean')
+        if self.use_d_knn and x_full is not None and x_imputed is not None:
+            Loss_d_knn = 0.1 * F.mse_loss(x_full, x_imputed, reduction='mean')
 
         # print ("Loss_bernoulli: ", Loss_bernoulli)
         total_loss = Loss_gaussian + Loss_gpd + Loss_bernoulli + Loss_d_knn
