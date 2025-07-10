@@ -1,12 +1,6 @@
 import torch
-import torch.nn.functional as F
-from sklearn.model_selection import train_test_split
-from torch.utils.data import DataLoader, TensorDataset
-from sklearn.preprocessing import StandardScaler
 import numpy as np
-import pandas as pd
 from vae_mixture_graph_model import VAE
-import csv
 import argparse
 import yaml
 from utils import load_graph_data
@@ -48,10 +42,28 @@ def _prepare_data(x, y, seq_len, batch_size, num_nodes, input_dim, horizon, outp
         x, y = _get_x_y_in_correct_dims(x, y, seq_len, batch_size, num_nodes, input_dim, horizon, output_dim)
         return x.to(device), y.to(device)
 
-def _compute_loss(y_true, y_predicted, standard_scaler):
-    y_true = standard_scaler.inverse_transform(y_true)
-    y_predicted = standard_scaler.inverse_transform(y_predicted)
+def _compute_loss(y_true, y_predicted, standard_scaler=None):
+    # y_true = standard_scaler.inverse_transform(y_true)
+    # y_predicted = standard_scaler.inverse_transform(y_predicted)
     return masked_mae_loss(y_predicted, y_true)
+
+def _compute_pot_loss(y_true, y_predicted, standard_scaler=None, threshold=None):
+    # y_true = standard_scaler.inverse_transform(y_true)
+    # y_predicted = standard_scaler.inverse_transform(y_predicted)
+    # threshold = standard_scaler.inverse_transform(np.array([[threshold]]))[0][0]
+
+    # print("y_true shape: ", y_true.shape)
+    # print("y_predicted shape: ", y_predicted.shape)
+    # print("Threshold shape: ", threshold.shape)
+
+    mask = ((y_true != 0) & (y_true >= threshold)).float()
+    # if mask.sum() != 0:
+    #     print("Has extreme values.")
+    mask /= mask.mean()
+    loss = torch.abs(y_predicted - y_true)
+    loss = loss * mask
+    loss[loss != loss] = 0
+    return loss.mean()
 
 def masked_mae_loss(y_pred, y_true):
     mask = (y_true != 0).float()
@@ -86,17 +98,17 @@ def main(args):
         _train_kwargs = supervisor_config.get('train')
 
         _data = load_dataset(**_data_kwargs)
-        standard_scaler = _data['scaler']
+        # standard_scaler = _data['scaler']
 
-        # Dùng toàn bộ x_train làm database để tìm nearest neighbors
-        X_database = torch.from_numpy(_data['x_train']).float().permute(1, 0, 2, 3)  # (seq_len, N, num_nodes)
+        # DÃ¹ng toÃ n bá»™ x_train lÃ m database Ä‘á»ƒ tÃ¬m nearest neighbors
+        X_database = torch.from_numpy(_data['x_train']).float().permute(1, 0, 2, 3).to(device)  # (seq_len, N, num_nodes)
         X_database = X_database.reshape(X_database.shape[0], X_database.shape[1], X_database.shape[2] * X_database.shape[3])  # (seq_len, N, num_nodes * input_dim)
 
         print("X_database shape: ", X_database.shape)
         
-        percent_missing = 35  # % nodes bị missing
+        percent_missing = 35  # % nodes bá»‹ missing
 
-        # Tạo mask (ngẫu nhiên)
+        # Táº¡o mask (ngáº«u nhiÃªn)
         num_missing_nodes = int(X_database.shape[2] * percent_missing / 100)
         # print("num_missing_nodes: ", num_missing_nodes)
         missing_nodes = np.random.choice(np.arange(X_database.shape[2]), size=num_missing_nodes, replace=False)
@@ -113,8 +125,10 @@ def main(args):
 
         optimizer = torch.optim.Adam(vae.parameters(), lr=args.lr)
 
-        epoch_num = _train_kwargs.get('epochs', 0)
-        # epoch_num = 20
+        print("_data['threshold']: ", _data['threshold'])
+
+        # epoch_num = _train_kwargs.get('epochs', 0)
+        epoch_num = 20
         num_batches = _data['train_loader'].num_batch
         batches_seen = num_batches * epoch_num
 
@@ -135,23 +149,23 @@ def main(args):
                                     _model_kwargs['num_nodes'], _model_kwargs['input_dim'], 
                                     _model_kwargs['horizon'], _model_kwargs['output_dim'])
                 
-                X_imputed = x.clone()  # A copy of x to update
+                X_imputed = x.clone().to(device)  # A copy of x to update
                 
                 if args.use_d_knn:
                     seq_len, batch_size, num_nodes = x.shape
-                    X_mask = torch.zeros((x.shape[0], x.shape[1], x.shape[2]), dtype=bool)
+                    X_mask = torch.zeros((x.shape[0], x.shape[1], x.shape[2]), dtype=bool).to(device)
                     for node in missing_nodes:
                         X_mask[:, :, node] = True  # Mark the missing nodes in the mask
-                    x_missing = x.clone()
+                    x_missing = x.clone().to(device)
                     x_missing[X_mask] = 0
 
-                    X_imputed = x_missing.clone()          
+                    X_imputed = x_missing.clone().to(device)          
 
                     for t in range(seq_len):
                         for b in range(batch_size):
                             for node_idx in range(num_nodes):
                                 if X_mask[t, b, node_idx]:
-                                    available_nodes = (~X_mask[t, b, :]).nonzero(as_tuple=False).squeeze()
+                                    available_nodes = (~X_mask[t, b, :]).nonzero(as_tuple=False).squeeze().to(device)
                                     available_nodes = available_nodes[available_nodes != node_idx]
                                     if len(available_nodes) == 0:
                                         continue
@@ -159,8 +173,8 @@ def main(args):
                                     x_miss = x_missing[t, b, available_nodes]
                                     x_full = X_database[:, b, available_nodes]
 
-                                    distances = vae.d_knn.compute_distances(x_full, x_miss)
-                                    weights = vae.d_knn.soft_knn(distances, x_miss)
+                                    distances = vae.d_knn.compute_distances(x_full, x_miss).to(device)
+                                    weights = vae.d_knn.soft_knn(distances, x_miss).to(device)
                                     target_vals = X_database[:, b, node_idx]
 
                                     x_imputed_val = torch.sum(weights * target_vals) / torch.sum(weights)
@@ -180,19 +194,20 @@ def main(args):
                 total_samples += x.size(0)
                 
                 count +=1	
-                if count == 11:
+                if count == 51:
                     break								
 
                 loss.backward()
                 optimizer.step()
             
-            print(f"Epoch {epoch + 1}/{args.epochs}, Loss: {epoch_loss / total_samples:.4f}")
+            print(f"Epoch {epoch + 1}/{epoch_num}, Loss: {epoch_loss / total_samples:.4f}")
         
         
         test_iterator = _data['test_loader'].get_iterator()
-        all_truths = []
-        all_predictions = []
         losses = []
+        pot_losses = [] # Peak over threshold losses
+        y_truths = []
+        y_preds = []
 
         vae.eval()
         count = 0
@@ -206,19 +221,19 @@ def main(args):
             if args.use_d_knn:
                 seq_len, batch_size, num_nodes = x.shape
 
-                X_mask = torch.zeros((x.shape[0], x.shape[1], x.shape[2]), dtype=bool)
+                X_mask = torch.zeros((x.shape[0], x.shape[1], x.shape[2]), dtype=bool).to(device)
                 for node in missing_nodes:
                     X_mask[:, :, node] = True  # Mark the missing nodes in the mask
-                x_missing = x.clone()
+                x_missing = x.clone().to(device)
                 x_missing[X_mask] = 0
 
-                X_imputed = x_missing.clone()            
+                X_imputed = x_missing.clone()  .to(device)          
 
                 for t in range(seq_len):
                     for b in range(batch_size):
                         for node_idx in range(num_nodes):
                             if X_mask[t, b, node_idx]:
-                                available_nodes = (~X_mask[t, b, :]).nonzero(as_tuple=False).squeeze()
+                                available_nodes = (~X_mask[t, b, :]).nonzero(as_tuple=False).squeeze().to(device)
                                 available_nodes = available_nodes[available_nodes != node_idx]
                                 if len(available_nodes) == 0:
                                     continue
@@ -226,8 +241,8 @@ def main(args):
                                 x_miss = x_missing[t, b, available_nodes]
                                 x_full = X_database[:, b, available_nodes]
 
-                                distances = vae.d_knn.compute_distances(x_full, x_miss)
-                                weights = vae.d_knn.soft_knn(distances, x_miss)
+                                distances = vae.d_knn.compute_distances(x_full, x_miss).to(device)
+                                weights = vae.d_knn.soft_knn(distances, x_miss).to(device)
                                 target_vals = X_database[:, b, node_idx]
 
                                 x_imputed_val = torch.sum(weights * target_vals) / torch.sum(weights)
@@ -235,29 +250,43 @@ def main(args):
 
             predictions, _, _, _, _, _ = vae(x=X_imputed, y=None, batches_seen=batches_seen)
 
-            loss = _compute_loss(y, predictions, standard_scaler)
+            loss = _compute_loss(y, predictions, None)
             losses.append(loss.item())
 
+            pot_loss = _compute_pot_loss(y, predictions, None, _data['threshold'])
+            pot_losses.append(pot_loss.item())
+
             # print("Prediction: ", predictions.shape)
-            all_truths.append(y)
-            all_predictions.append(predictions)
+            y_truths.append(y.detach().cpu())
+            y_preds.append(predictions.detach().cpu())
 
             count +=1	
-            if count == 11:
+            if count == 51:
                 break
 
         # all_truths = torch.cat(all_truths, dim=0)
         # all_predictions.append(predictions)
 
         average_mae = np.mean(losses)
+        average_pot_loss = np.mean(pot_losses)
 
-        # with open('predictions_vs_truth.csv', mode='w', newline='') as file:
-        #     writer = csv.writer(file)
-        #     writer.writerow(["Truth", "Predictions"])
-        #     for truth, prediction in zip(all_truths, all_predictions):
-        #         writer.writerow([truth.item(), prediction.item()])
+        y_preds = np.concatenate(y_preds, axis=1)
+        y_truths = np.concatenate(y_truths, axis=1)
+
+        y_preds = np.array(y_preds)   # (seq_len, batch_size, num_nodes)
+        y_truths = np.array(y_truths)
+
+        node_idx = 0
+
+        y_pred_series = y_preds[:, :, node_idx].reshape(-1)
+        y_truth_series = y_truths[:, :, node_idx].reshape(-1)
+
+        data = np.stack([y_truth_series, y_pred_series], axis=1)  # shape: (seq_len * batch_size, 2)
+
+        np.savetxt("prediction_vs_truth.csv", data, delimiter=",", header="Truth,Predictions", comments='')
 
         print(f"Test MAE: {average_mae:.4f}")
+        print(f"Test Peak Over Threshold Loss: {average_pot_loss:.4f}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

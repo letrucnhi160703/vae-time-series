@@ -121,7 +121,12 @@ class LSTM_GCN_Encoder(nn.Module):
         # x = x.transpose(0, 1)
         dcrnn_output = self.dcrnn(x, y, batches_seen)
 
+        # print("DCRNN output shape: ", dcrnn_output.shape)
+
         h_n = dcrnn_output[-1]  # Shape: (batch_size, num_nodes * output_dim)
+        # h_n = dcrnn_output
+
+        # print("h_n shape: ", h_n.shape)
 
         # FC Layers
         hidden = F.relu(self.fc1(h_n))
@@ -183,10 +188,13 @@ class Decoder(nn.Module):
         self.out = nn.Linear(500, future_steps*num_nodes)
 
     def forward(self, z):
-        # print("Z shape: ", z.shape)
+        # print("At Decoder Z shape: ", z.shape)
         z = F.relu(self.fc1(z))
         z = self.dropout(F.relu(self.fc2(z)))
         output = self.out(z)
+        # print("Output shape before reshape: ", output.shape)
+        # print("Future steps: ", self.future_steps)
+        # print("Num nodes: ", self.num_nodes)
         return output.view(-1, self.future_steps, self.num_nodes).permute(1, 0, 2)
 
 class VAE(nn.Module):
@@ -261,11 +269,17 @@ class VAE(nn.Module):
         # print("##########", x_imputed.shape)
         z_mean_normal, z_log_var_normal, z_scale_extreme, z_shape_extreme, z_logits_zero = self.encoder(x, y, batches_seen)
         z = self.reparameterize(z_mean_normal, z_log_var_normal, z_scale_extreme, z_shape_extreme, z_logits_zero)
+        # print("Z shape: ", z.shape)
+        # print("Z mean normal shape: ", z_mean_normal.shape)
+        # print("Z log var normal shape: ", z_log_var_normal.shape)
+        
         reconstructed = self.decoder(z)
         return reconstructed, z_mean_normal, z_log_var_normal, z_scale_extreme, z_shape_extreme, z_logits_zero
 
     def loss_function(self, reconstructed, y, z_mean_normal, z_log_var_normal, threshold=None,
                       z_scale_extreme=None, z_shape_extreme=None, z_logits_zero=None, x_full=None, x_imputed=None):
+        
+        # print("Reconstructed shape: ", reconstructed.shape)
         # If not using GPD or Bernoulli, return Gaussian loss
         if not self.use_gpd and not self.use_bernoulli and not self.use_d_knn:
             R_gaussian = F.mse_loss(reconstructed, y, reduction='mean')
@@ -293,32 +307,58 @@ class VAE(nn.Module):
         # GPD Loss
         Loss_gpd = 0
         if self.use_gpd:
-            extreme_mask = extreme_mask.squeeze(-1) # LÃ m pháº³ng mask
-            y_extreme = y[extreme_mask] # Lá»c ra giÃ¡ trá»‹ cá»±c Ä‘oan
+            # Mask shape: [seq_len, batch_size, num_nodes]
+            mask_node = extreme_mask.any(dim=0)  # [batch_size, num_nodes]
+            # print("Mask node shape:", mask_node.shape)
+            y_extreme = y[extreme_mask]  # [num_extreme]
+            # print("y_extreme shape:", y_extreme.shape)
             if y_extreme.numel() != 0:
-                scale_extreme = z_scale_extreme[extreme_mask] # Lá»c scale
-                shape_extreme = z_shape_extreme[extreme_mask] # Lá»c shape
-                excess = y_extreme - threshold # TÃ­nh y_i - u
-                gpd_nll = torch.mean(torch.log(scale_extreme) + (1 + 1 / shape_extreme) * torch.log(1 + shape_extreme * excess / scale_extreme))
-                # print('Scale extreme:', scale_extreme)
-                # print('Shape extreme:', shape_extreme)
-                # print('Excess:', excess)
-                # print('GPD NLL:', gpd_nll)
-                # if gpd_nll < 0:
-                #     print('shape_extreme:', shape_extreme)
+                # print("y has extreme values!")
+
+                batch_size = z_scale_extreme.shape[0]
+                latent_dim = self.encoder.mean_layer_normal.out_features // mask_node.shape[1]
+                num_nodes = mask_node.shape[1]
+
+                z_scale_extreme = z_scale_extreme.view(batch_size, num_nodes, latent_dim).mean(-1)
+                z_shape_extreme = z_shape_extreme.view(batch_size, num_nodes, latent_dim).mean(-1)
+
+                # Tìm index (time, batch, node)
+                extreme_idx = extreme_mask.nonzero(as_tuple=True)  # tuple of (time, batch, node)
+                # print("extreme_idx shape:", [x.shape for x in extreme_idx])
+
+                # Map scale/shape theo batch, node
+                scale_extreme = z_scale_extreme[extreme_idx[1], extreme_idx[2]]  # [num_extreme]
+                shape_extreme = z_shape_extreme[extreme_idx[1], extreme_idx[2]]  # [num_extreme]
+
+                excess = y_extreme - threshold  # [num_extreme]
+
+                gpd_nll = torch.mean(
+                    torch.log(scale_extreme)
+                    + (1 + 1 / shape_extreme) * torch.log(1 + shape_extreme * excess / scale_extreme)
+                )
+
                 Loss_gpd = pi_gpd * gpd_nll
+
 
         # Bernoulli Loss
         Loss_bernoulli = 0
-        if self.use_bernoulli:
-            zero_mask = zero_mask.squeeze(-1)
-            y_zero = y[zero_mask]
-            if y_zero.numel() != 0:
-                logits_zero = z_logits_zero[zero_mask]
-                # print('Logits zero:', logits_zero)
-                bernoulli_nll = -torch.mean(y_zero * torch.log(torch.sigmoid(logits_zero)) + (1 - y_zero) * torch.log(1 - torch.sigmoid(logits_zero)))
-                # print('Bernoulli NLL:', bernoulli_nll)
-                Loss_bernoulli = pi_bernoulli * bernoulli_nll
+        # if self.use_bernoulli:
+        #     mask_node = zero_mask.any(dim=0)  # [batch_size, num_nodes]
+        #     y_zero = y[zero_mask]  # [num_extreme]
+        #     if y_zero.numel() != 0:
+        #         batch_size = z_logits_zero.shape[0]
+        #         latent_dim = self.encoder.logits_layer_zero.out_features // mask_node.shape[1]
+        #         num_nodes = mask_node.shape[1]
+
+        #         z_logits_zero = z_logits_zero.view(batch_size, num_nodes, latent_dim).mean(-1)
+
+        #         zero_idx = zero_mask.nonzero(as_tuple=True)
+
+        #         logits_zero = z_logits_zero[zero_idx[1], zero_idx[2]]
+        #         # print('Logits zero:', logits_zero)
+        #         bernoulli_nll = -torch.mean(y_zero * torch.log(torch.sigmoid(logits_zero)) + (1 - y_zero) * torch.log(1 - torch.sigmoid(logits_zero)))
+        #         # print('Bernoulli NLL:', bernoulli_nll)
+        #         Loss_bernoulli = pi_bernoulli * bernoulli_nll
 
         # D-KNN Loss
         Loss_d_knn = 0
