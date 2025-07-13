@@ -10,6 +10,10 @@ from torch.utils.tensorboard import SummaryWriter
 import os
 import time
 from dknn.dknn_model import DKNNImputer3D
+from sympy import symbols, diff, log, beta, hyper, simplify
+from sympy.abc import alpha
+from sympy import lambdify
+from dknn.gpd import GeneralizedPareto
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -19,10 +23,102 @@ def reparameterize_gaussian(mean, logvar):
     eps = torch.randn_like(std)
     return mean + eps * std
 
-# Custom GPD reparameterization function
-def reparameterize_gpd(scale, shape, size):
-    uniform_sample = torch.rand(size).to(device)
-    return scale / shape * ((1 - uniform_sample) ** (-shape) - 1)
+# # Custom GPD reparameterization function
+# def reparameterize_gpd(scale, shape, size):
+#     uniform_sample = torch.rand(size).to(device)
+#     return scale / shape * ((1 - uniform_sample) ** (-shape) - 1)
+
+def reparameterize_gpd(mean, scale, shape):
+    """    
+    Args:
+        mean (float or tensor): location parameter
+        scale (float or tensor): scale parameter (> 0)
+        shape (float or tensor): shape parameter
+    
+    Returns:
+        torch.Tensor: GPD samples
+    """
+    # mean = torch.tensor(mean, device=device)
+    # scale = torch.tensor(scale, device=device)
+    # shape = torch.tensor(shape, device=device)
+
+    u = torch.rand_like(mean)
+    u = torch.clamp(u, min=1e-6, max=1 - 1e-6)
+
+    z = mean + (scale / shape) * ((1 - u) ** (-shape) - 1)
+
+    return z
+
+# def kl_gpd(z_mean, z_shape, z_scale, xi0=0.1, sigma0=1.0):
+#     """
+#     KL divergence between GPD(z_shape, z_scale) and fixed GPD(xi0=0.1, sigma0=1).
+#     Assumes same location parameter μ.
+#     """
+#     xi = z_shape.detach().cpu().numpy()
+#     sigma = z_scale.detach().cpu().numpy()
+#     mean = z_mean.detach().cpu().numpy()
+
+#     print("xi shape: ", xi.shape)
+
+#     # term3: numerical derivative wrt α at α=0
+
+#     z = (sigma*xi0 - sigma0*xi) / (sigma*xi0)
+
+#     beta_val = beta(1/xi0 - alpha, alpha + 1)
+#     hyper_val = hyper((1/xi0 - alpha, -alpha), (1/xi0 + 1,), z)
+
+#     expr = (sigma*xi0/(sigma0*mean + 1e-10))**alpha * beta_val * hyper_val
+
+#     # Lấy đạo hàm tại alpha = 0
+#     d_expr = diff(expr, alpha)
+#     f = lambdify((), d_expr.subs(alpha, 0), modules="mpmath")
+#     val = float(f())
+
+#     # Hệ số ngoài
+#     coeff = (1/xi0 + 1) * (1/sigma0)
+
+#     # Totsigma0l KL
+#     kl = log(sigma0 / sigma) + (1/sigma0 + 1) * xi0**2 / sigma0 + coeff * val
+#     return kl
+
+def kl_gpd_mc(z_mean, z_shape, z_scale, xi0=0.1, sigma0=1.0, num_samples=100):
+    # z_shape, z_scale: shape (12, 2, 4, 6624)
+    q = GeneralizedPareto(concentration=z_shape, scale=z_scale, loc=z_mean)
+    p = GeneralizedPareto(concentration=torch.full_like(z_shape, xi0),
+                          scale=torch.full_like(z_scale, sigma0), loc=z_mean)
+    
+    samples = q.rsample((num_samples,))  # (num_samples, 12, 2, 4, 6624)
+    # # Kiểm tra sample có nhỏ hơn loc không
+    # invalid_mask = samples < q.loc
+    # if invalid_mask.any():
+    #     print("mẫu nhỏ hơn loc")
+
+
+    # print("samples: ", samples[0][0][0][0][0])
+    # print("z_shape: ", z_shape[0][0][0][0])
+
+    logq = q.log_prob(samples)
+    logp = p.log_prob(samples)
+
+    # # Kiểm tra sample có nhỏ hơn loc không
+    has_nan = torch.isinf(logp)
+    if has_nan.any():
+        print("P nannnnnn")
+    has_nan = torch.isinf(logq)
+    if has_nan.any():
+        print("Q nannnnnn")
+
+    # print("logq shape: ", logq[0][0][0][0][0])
+    # print("logp shape: ", logp[0][0][0][0][0])
+    # print("logq shape: ", logq.shape)
+    # print("logp shape: ", logp.shape)
+
+    # diff = logq - logp
+    # valid = (~torch.isnan(diff)) & (~torch.isinf(diff))
+    # kl = diff[valid].mean() 
+    # print("kl: ", kl)
+    kl = (logq - logp).mean()
+    return kl
 
 # Bernoulli sampling function
 def reparameterize_bernoulli(logits):
@@ -86,13 +182,14 @@ class LSTM_GCN_Encoder(nn.Module):
 
         # DCRNN Layer
         self.dcrnn = DCRNNModel(adj_mx, **self._model_kwargs)
-        dcrnn_output_dim = self._model_kwargs['num_nodes'] * self._model_kwargs['output_dim']
+        dcrnn_output_dim = self._model_kwargs['num_nodes'] * self._model_kwargs['rnn_units']
         # print("DCRNN output dim: ", dcrnn_output_dim)
         num_nodes = self._model_kwargs['num_nodes']
 
         fc_input_dim = dcrnn_output_dim
+        # fc_input_dim = 828
 
-        # FC Layers
+        # FC Layers     
         self.fc1 = nn.Linear(fc_input_dim, 128)
         self.fc2 = nn.Linear(128, 64)
         self.dropout = nn.Dropout(0.3)
@@ -119,12 +216,13 @@ class LSTM_GCN_Encoder(nn.Module):
         #     h_n = self.gcn(h_n, edge_index)
 
         # x = x.transpose(0, 1)
-        dcrnn_output = self.dcrnn(x, y, batches_seen)
+        _, dcrnn_output = self.dcrnn.encoder(x)
+        # dcrnn_output = self.dcrnn(x, y, batches_seen)
 
         # print("DCRNN output shape: ", dcrnn_output.shape)
 
-        h_n = dcrnn_output[-1]  # Shape: (batch_size, num_nodes * output_dim)
-        # h_n = dcrnn_output
+        # h_n = dcrnn_output[-1]  # Shape: (batch_size, num_nodes * output_dim)
+        h_n = dcrnn_output
 
         # print("h_n shape: ", h_n.shape)
 
@@ -178,28 +276,37 @@ class LSTM_GCN_Encoder(nn.Module):
         return log_dir
 
 class Decoder(nn.Module):
-    def __init__(self, latent_dim, future_steps, num_nodes):
+    def __init__(self, latent_dim, output_dim, num_nodes, num_layers):
         super(Decoder, self).__init__()
-        self.future_steps = future_steps
+        self.output_dim = output_dim
         self.num_nodes = num_nodes
-        self.fc1 = nn.Linear(latent_dim*num_nodes, 128)
+        self.num_layers = num_layers
+
+        input_size = latent_dim * num_nodes * num_layers
+
+        # self.fc1 = nn.Linear(latent_dim*num_nodes, 128)
+        # self.fc1 = nn.Linear(6624, 128)
+        self.fc1 = nn.Linear(input_size, 128)
         self.fc2 = nn.Linear(128, 500)
         self.dropout = nn.Dropout(0.3)
-        self.out = nn.Linear(500, future_steps*num_nodes)
+        self.out = nn.Linear(500, output_dim*num_nodes)
 
     def forward(self, z):
         # print("At Decoder Z shape: ", z.shape)
+        z = z.permute(1, 0, 2).reshape(z.size(1), -1)
+
         z = F.relu(self.fc1(z))
         z = self.dropout(F.relu(self.fc2(z)))
         output = self.out(z)
         # print("Output shape before reshape: ", output.shape)
         # print("Future steps: ", self.future_steps)
         # print("Num nodes: ", self.num_nodes)
-        return output.view(-1, self.future_steps, self.num_nodes).permute(1, 0, 2)
+        # return output.view(-1, self.future_steps, self.num_nodes).permute(1, 0, 2)
+        return output
 
 class VAE(nn.Module):
-    def __init__(self, adj_mx, latent_dim, future_steps, beta=0.001, 
-                 use_d_knn=True, use_gpd=True, use_bernoulli=True, dknn_input_dim=1, num_available=0, **dcrnn_kwargs):
+    def __init__(self, adj_mx, latent_dim, beta=0.001, 
+                 use_d_knn=True, use_gpd=True, use_bernoulli=True, dknn_input_dim=1, num_available=0, threshold=None, **dcrnn_kwargs):
         super(VAE, self).__init__()
         
         # Module on/off flags
@@ -212,8 +319,13 @@ class VAE(nn.Module):
 
         model_kwargs = dcrnn_kwargs.get('model')
         num_nodes = model_kwargs['num_nodes']
-        self.decoder = Decoder(latent_dim, future_steps, num_nodes)
+        output_dim = model_kwargs['output_dim']
+        num_rnn_layers = model_kwargs['num_rnn_layers']
+        self.horizon = model_kwargs['horizon']
+        self.decoder = Decoder(latent_dim, output_dim, num_nodes, num_rnn_layers)
         self.beta = beta
+
+        self.threshold = threshold
 
         # Init modules if flags are on
         if self.use_d_knn:
@@ -237,7 +349,10 @@ class VAE(nn.Module):
         if not self.use_gpd and not self.use_bernoulli:
             return z_gaussian  # Tráº£ vá» Gaussian náº¿u khÃ´ng dÃ¹ng GPD/Bernoulli
 
-        z_gpd = reparameterize_gpd(z_scale_extreme, z_shape_extreme, z_mean_normal.size()) if self.use_gpd else torch.zeros_like(z_mean_normal)
+        # print("self.threshold: ", self.threshold)
+        threshold_tensor = torch.full(z_scale_extreme.shape, self.threshold)
+        # z_gpd = reparameterize_gpd(z_scale_extreme, z_shape_extreme, z_mean_normal.size()) if self.use_gpd else torch.zeros_like(z_mean_normal)
+        z_gpd = reparameterize_gpd(threshold_tensor, z_scale_extreme, z_shape_extreme) if self.use_gpd else torch.zeros_like(z_mean_normal)
         z_bernoulli = reparameterize_bernoulli(z_logits_zero) if self.use_bernoulli else torch.zeros_like(z_mean_normal)
 
         choice = torch.rand(z_mean_normal.size(0)).to(device)
@@ -273,7 +388,14 @@ class VAE(nn.Module):
         # print("Z mean normal shape: ", z_mean_normal.shape)
         # print("Z log var normal shape: ", z_log_var_normal.shape)
         
-        reconstructed = self.decoder(z)
+        # reconstructed = self.decoder(z)
+        reconstructed = []
+        for t in range(self.horizon):
+            # print("z[t] shape: ", z[t].shape)
+            decoder_output = self.decoder(z[t])
+            reconstructed.append(decoder_output)
+        reconstructed = torch.stack(reconstructed, dim=0)
+
         return reconstructed, z_mean_normal, z_log_var_normal, z_scale_extreme, z_shape_extreme, z_logits_zero
 
     def loss_function(self, reconstructed, y, z_mean_normal, z_log_var_normal, threshold=None,
@@ -304,41 +426,45 @@ class VAE(nn.Module):
         # KL_gaussian = 0
         Loss_gaussian = pi_gaussian * (R_gaussian + self.beta * KL_gaussian)
 
+        threshold_tensor = torch.full(z_scale_extreme.shape, self.threshold)
+
         # GPD Loss
         Loss_gpd = 0
         if self.use_gpd:
+            # print("z_scale_extreme shape: ", z_scale_extreme.shape)
             # Mask shape: [seq_len, batch_size, num_nodes]
-            mask_node = extreme_mask.any(dim=0)  # [batch_size, num_nodes]
+            # mask_node = extreme_mask.any(dim=0)  # [batch_size, num_nodes]
             # print("Mask node shape:", mask_node.shape)
             y_extreme = y[extreme_mask]  # [num_extreme]
             # print("y_extreme shape:", y_extreme.shape)
             if y_extreme.numel() != 0:
                 # print("y has extreme values!")
 
-                batch_size = z_scale_extreme.shape[0]
-                latent_dim = self.encoder.mean_layer_normal.out_features // mask_node.shape[1]
-                num_nodes = mask_node.shape[1]
+                # batch_size = z_scale_extreme.shape[0]
+                # latent_dim = self.encoder.mean_layer_normal.out_features // mask_node.shape[1]
+                # num_nodes = mask_node.shape[1]
 
-                z_scale_extreme = z_scale_extreme.view(batch_size, num_nodes, latent_dim).mean(-1)
-                z_shape_extreme = z_shape_extreme.view(batch_size, num_nodes, latent_dim).mean(-1)
+                # z_scale_extreme = z_scale_extreme.view(batch_size, num_nodes, latent_dim).mean(-1)
+                # z_shape_extreme = z_shape_extreme.view(batch_size, num_nodes, latent_dim).mean(-1)
 
-                # Tìm index (time, batch, node)
-                extreme_idx = extreme_mask.nonzero(as_tuple=True)  # tuple of (time, batch, node)
-                # print("extreme_idx shape:", [x.shape for x in extreme_idx])
+                # # Tìm index (time, batch, node)
+                # extreme_idx = extreme_mask.nonzero(as_tuple=True)  # tuple of (time, batch, node)
+                # # print("extreme_idx shape:", [x.shape for x in extreme_idx])
 
-                # Map scale/shape theo batch, node
-                scale_extreme = z_scale_extreme[extreme_idx[1], extreme_idx[2]]  # [num_extreme]
-                shape_extreme = z_shape_extreme[extreme_idx[1], extreme_idx[2]]  # [num_extreme]
+                # # Map scale/shape theo batch, node
+                # scale_extreme = z_scale_extreme[extreme_idx[1], extreme_idx[2]]  # [num_extreme]
+                # shape_extreme = z_shape_extreme[extreme_idx[1], extreme_idx[2]]  # [num_extreme]
 
-                excess = y_extreme - threshold  # [num_extreme]
+                # excess = y_extreme - threshold  # [num_extreme]
 
-                gpd_nll = torch.mean(
-                    torch.log(scale_extreme)
-                    + (1 + 1 / shape_extreme) * torch.log(1 + shape_extreme * excess / scale_extreme)
-                )
+                # gpd_nll = torch.mean(
+                #     torch.log(scale_extreme)
+                #     + (1 + 1 / shape_extreme) * torch.log(1 + shape_extreme * excess / scale_extreme)
+                # )
+                kld_gpd = kl_gpd_mc(threshold_tensor, z_shape_extreme, z_scale_extreme).mean()
+                Loss_gpd = pi_gpd * kld_gpd
 
-                Loss_gpd = pi_gpd * gpd_nll
-
+                # print("Loss_gpd: ", Loss_gpd)
 
         # Bernoulli Loss
         Loss_bernoulli = 0

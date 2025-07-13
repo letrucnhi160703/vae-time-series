@@ -114,11 +114,16 @@ class DCRNNModel(nn.Module, Seq2SeqAttrs):
         :param inputs: shape (seq_len, batch_size, num_sensor * input_dim)
         :return: encoder_hidden_state: (num_layers, batch_size, self.hidden_state_size)
         """
+
+        output = []
         encoder_hidden_state = None
         for t in range(self.encoder_model.seq_len):
             _, encoder_hidden_state = self.encoder_model(inputs[t], encoder_hidden_state)
+            output.append(encoder_hidden_state)
 
-        return encoder_hidden_state
+        output = torch.stack(output, dim=0)
+
+        return encoder_hidden_state, output
 
     def decoder(self, encoder_hidden_state, labels=None, batches_seen=None):
         """

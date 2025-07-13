@@ -73,7 +73,7 @@ def main(args):
         #         tf.config.set_visible_devices(physical_devices[0], 'GPU')
         #         tf.config.experimental.set_memory_growth(physical_devices[0], True)
 
-        print("Supervisor config:", supervisor_config)
+        # print("Supervisor config:", supervisor_config)
 
         _data_kwargs = supervisor_config.get('data')
         _model_kwargs = supervisor_config.get('model')

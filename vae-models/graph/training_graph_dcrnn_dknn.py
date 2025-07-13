@@ -43,14 +43,16 @@ def _prepare_data(x, y, seq_len, batch_size, num_nodes, input_dim, horizon, outp
         return x.to(device), y.to(device)
 
 def _compute_loss(y_true, y_predicted, standard_scaler=None):
-    # y_true = standard_scaler.inverse_transform(y_true)
-    # y_predicted = standard_scaler.inverse_transform(y_predicted)
+    if standard_scaler:
+        y_true = standard_scaler.inverse_transform(y_true)
+        y_predicted = standard_scaler.inverse_transform(y_predicted)
     return masked_mae_loss(y_predicted, y_true)
 
 def _compute_pot_loss(y_true, y_predicted, standard_scaler=None, threshold=None):
-    # y_true = standard_scaler.inverse_transform(y_true)
-    # y_predicted = standard_scaler.inverse_transform(y_predicted)
-    # threshold = standard_scaler.inverse_transform(np.array([[threshold]]))[0][0]
+    if standard_scaler:
+        y_true = standard_scaler.inverse_transform(y_true)
+        y_predicted = standard_scaler.inverse_transform(y_predicted)
+        threshold = standard_scaler.inverse_transform(np.array([[threshold]]))[0][0]
 
     # print("y_true shape: ", y_true.shape)
     # print("y_predicted shape: ", y_predicted.shape)
@@ -91,14 +93,14 @@ def main(args):
         #         tf.config.set_visible_devices(physical_devices[0], 'GPU')
         #         tf.config.experimental.set_memory_growth(physical_devices[0], True)
 
-        print("Supervisor config:", supervisor_config)
+        # print("Supervisor config:", supervisor_config)
 
         _data_kwargs = supervisor_config.get('data')
         _model_kwargs = supervisor_config.get('model')
         _train_kwargs = supervisor_config.get('train')
 
         _data = load_dataset(**_data_kwargs)
-        # standard_scaler = _data['scaler']
+        standard_scaler = _data['scaler']
 
         # DÃ¹ng toÃ n bá»™ x_train lÃ m database Ä‘á»ƒ tÃ¬m nearest neighbors
         X_database = torch.from_numpy(_data['x_train']).float().permute(1, 0, 2, 3).to(device)  # (seq_len, N, num_nodes)
@@ -116,9 +118,9 @@ def main(args):
 
         num_available = X_database.shape[2] - num_missing_nodes
 
-        vae = VAE(adj_mx=adj_mx, latent_dim=args.latent_dim, num_nodes=_model_kwargs.get('num_nodes'), future_steps=args.predict_steps, 
+        vae = VAE(adj_mx=adj_mx, latent_dim=args.latent_dim, num_nodes=_model_kwargs.get('num_nodes'), 
                   use_d_knn=args.use_d_knn, use_gpd=args.use_gpd, use_bernoulli=args.use_bernoulli, 
-                  dknn_input_dim=_data['x_train'].shape[-1], num_available=num_available,
+                  dknn_input_dim=_data['x_train'].shape[-1], num_available=num_available, threshold=_data['threshold'],
                   **supervisor_config).to(device)
 
         train_iterator = _data['train_loader'].get_iterator()
@@ -128,7 +130,7 @@ def main(args):
         print("_data['threshold']: ", _data['threshold'])
 
         # epoch_num = _train_kwargs.get('epochs', 0)
-        epoch_num = 20
+        epoch_num = 5
         num_batches = _data['train_loader'].num_batch
         batches_seen = num_batches * epoch_num
 
@@ -136,6 +138,7 @@ def main(args):
             vae.train()
             epoch_loss = 0
             total_samples = 0
+            pot_losses = []
 
             train_iterator = _data['train_loader'].get_iterator()
             
@@ -181,7 +184,7 @@ def main(args):
                                     X_imputed[t, b, node_idx] = x_imputed_val
 
                 forecasting, z_mean_normal, z_log_var_normal,z_scale_extreme, z_shape_extreme, z_logits_zero = vae(x=X_imputed, y=y, batches_seen=batches_seen)
-
+                # print("forecasting shape: ", forecasting.shape)
                 if batches_seen == 0:
                     optimizer = torch.optim.Adam(vae.parameters(), lr=args.lr)
 
@@ -192,6 +195,9 @@ def main(args):
 
                 epoch_loss += loss.item() * x.size(0)
                 total_samples += x.size(0)
+
+                pot_loss = _compute_pot_loss(y, forecasting, standard_scaler, _data['threshold'])
+                pot_losses.append(pot_loss.item())
                 
                 count +=1	
                 if count == 51:
@@ -200,7 +206,8 @@ def main(args):
                 loss.backward()
                 optimizer.step()
             
-            print(f"Epoch {epoch + 1}/{epoch_num}, Loss: {epoch_loss / total_samples:.4f}")
+            average_pot_loss = np.mean(pot_losses)
+            print(f"Epoch {epoch + 1}/{epoch_num}, Loss: {epoch_loss / total_samples:.4f}, POT loss: {average_pot_loss}")
         
         
         test_iterator = _data['test_loader'].get_iterator()
@@ -250,10 +257,10 @@ def main(args):
 
             predictions, _, _, _, _, _ = vae(x=X_imputed, y=None, batches_seen=batches_seen)
 
-            loss = _compute_loss(y, predictions, None)
+            loss = _compute_loss(y, predictions, standard_scaler)
             losses.append(loss.item())
 
-            pot_loss = _compute_pot_loss(y, predictions, None, _data['threshold'])
+            pot_loss = _compute_pot_loss(y, predictions, standard_scaler, _data['threshold'])
             pot_losses.append(pot_loss.item())
 
             # print("Prediction: ", predictions.shape)
@@ -261,7 +268,7 @@ def main(args):
             y_preds.append(predictions.detach().cpu())
 
             count +=1	
-            if count == 51:
+            if count == 11:
                 break
 
         # all_truths = torch.cat(all_truths, dim=0)
@@ -298,7 +305,7 @@ if __name__ == "__main__":
     parser.add_argument("--window_length", type=int, default=12, help="Window length for sliding window")
     parser.add_argument("--predict_steps", type=int, default=1, help="Number of steps to predict")
     parser.add_argument("--percentile", type=int, default=90, help="Percentile for threshold")
-    parser.add_argument("--lr", type=float, default=5e-5, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
     parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs")
     parser.add_argument("--output_dim", type=int, default=64, help="Output layer dimension")
