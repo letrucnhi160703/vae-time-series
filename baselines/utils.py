@@ -226,7 +226,7 @@ def load_dataset(dataset_dir, batch_size, test_batch_size=None, **kwargs):
 
     return data
 
-def load_dataset_minmax(dataset_dir, batch_size, test_batch_size=None, **kwargs):
+def load_dataset_min_max(dataset_dir, batch_size, test_batch_size=None, **kwargs):
     data = {}
     for category in ['train', 'val', 'test']:
         cat_data = np.load(os.path.join(dataset_dir, category + '.npz'))

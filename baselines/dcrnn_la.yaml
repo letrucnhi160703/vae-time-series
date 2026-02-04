@@ -1,11 +1,11 @@
-base_dir: ../../datasets/model
+base_dir: ../datasets/model
 log_level: INFO
 data:
   batch_size: 4
-  dataset_dir: ../../datasets/METR-LA
+  dataset_dir: ../datasets/METR-LA
   test_batch_size: 4
   val_batch_size: 4
-  graph_pkl_filename: ../../datasets/sensor_graph/adj_mx.pkl
+  graph_pkl_filename: ../datasets/sensor_graph/adj_mx.pkl
   percentile: 95
 
 model:

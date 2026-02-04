@@ -31,7 +31,16 @@ class DKNNImputer3D(nn.Module):
         distances: [seq_len]
         x_miss: [num_neighbors]
         """
+        # print("Min of distances:", torch.min(distances).item())
+        # print("Max of distances:", torch.max(distances).item())
+        # print("Mean of distances:", torch.mean(distances).item())
+
+        # print("Distances:", distances.shape)
+        # print("x_miss:", x_miss.shape)
         base_weights = torch.exp(-distances / self.t)
+
+        if torch.sum(base_weights) == 0:
+            print("Warning: base_weights sum is zero.")
         alpha = self.mlp(x_miss)  # [seq_len]
         weights = base_weights * alpha
         return weights

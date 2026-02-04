@@ -5,6 +5,135 @@ from utils import calculate_scaled_laplacian, calculate_random_walk_matrix
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+class AttentionLayer(torch.nn.Module):
+    """Perform attention across the -2 dim (the -1 dim is `model_dim`).
+
+    Make sure the tensor is permuted to correct shape before attention.
+
+    E.g.
+    - Input shape (batch_size, in_steps, num_nodes, model_dim).
+    - Then the attention will be performed across the nodes.
+
+    Also, it supports different src and tgt length.
+
+    But must `src length == K length == V length`.
+
+    """
+
+    def __init__(self, model_dim, num_heads=8, mask=False):
+        super().__init__()
+
+        self.model_dim = model_dim
+        self.num_heads = num_heads
+        self.mask = mask
+
+        self.head_dim = model_dim // num_heads
+
+        self.FC_Q = torch.nn.Linear(model_dim, model_dim)
+        self.FC_K = torch.nn.Linear(model_dim, model_dim)
+        self.FC_V = torch.nn.Linear(model_dim, model_dim)
+
+        self.out_proj = torch.nn.Linear(model_dim, model_dim)
+
+    def forward(self, query, key, value):
+        # Q    (batch_size, ..., tgt_length, model_dim)
+        # K, V (batch_size, ..., src_length, model_dim)
+        batch_size = query.shape[0]
+        tgt_length = query.shape[-2]
+        src_length = key.shape[-2]
+
+        # print("batch_size: ", batch_size)
+        # print("tgt_length: ", tgt_length)
+        # print("src_length: ", src_length)
+
+        query = self.FC_Q(query)
+        key = self.FC_K(key)
+        value = self.FC_V(value)
+
+        # Qhead, Khead, Vhead (num_heads * batch_size, ..., length, head_dim)
+        query = torch.cat(torch.split(query, self.head_dim, dim=-1), dim=0)
+        key = torch.cat(torch.split(key, self.head_dim, dim=-1), dim=0)
+        value = torch.cat(torch.split(value, self.head_dim, dim=-1), dim=0)
+
+        key = key.transpose(
+            -1, -2
+        )  # (num_heads * batch_size, ..., head_dim, src_length)
+
+        attn_score = (
+            query @ key
+        ) / self.head_dim**0.5  # (num_heads * batch_size, ..., tgt_length, src_length)
+
+        if self.mask:
+            mask = torch.ones(
+                tgt_length, src_length, dtype=torch.bool, device=query.device
+            ).tril()  # lower triangular part of the matrix
+            attn_score.masked_fill_(~mask, -torch.inf)  # fill in-place
+
+        attn_score = torch.softmax(attn_score, dim=-1)
+        out = attn_score @ value  # (num_heads * batch_size, ..., tgt_length, head_dim)
+        out = torch.cat(
+            torch.split(out, batch_size, dim=0), dim=-1
+        )  # (batch_size, ..., tgt_length, head_dim * num_heads = model_dim)
+
+        out = self.out_proj(out)
+
+        return out
+
+
+class SelfAttentionLayer(torch.nn.Module):
+    def __init__(
+        self, model_dim, feed_forward_dim=2048, num_heads=8, dropout=0.0, mask=False
+    ):
+        super().__init__()
+
+        self.attn = AttentionLayer(model_dim, num_heads, mask)
+        self.feed_forward = torch.nn.Sequential(
+            torch.nn.Linear(model_dim, feed_forward_dim),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.Linear(feed_forward_dim, model_dim),
+        )
+        self.ln1 = torch.nn.LayerNorm(model_dim)
+        self.ln2 = torch.nn.LayerNorm(model_dim)
+        self.dropout1 = torch.nn.Dropout(dropout)
+        self.dropout2 = torch.nn.Dropout(dropout)
+
+    def forward(self, x, dim=-2):
+        x = x.transpose(dim, -2)
+        # x: (batch_size, ..., length, model_dim)
+        residual = x
+        out = self.attn(x, x, x)  # (batch_size, ..., length, model_dim)
+        out = self.dropout1(out)
+        out = self.ln1(residual + out)
+
+        residual = out
+        out = self.feed_forward(out)  # (batch_size, ..., length, model_dim)
+        out = self.dropout2(out)
+        out = self.ln2(residual + out)
+
+        out = out.transpose(dim, -2)
+        return out
+
+
+class SelfAttentionLayer2(torch.nn.Module):
+    def __init__(self, model_dim, num_heads=4, dropout=0.1):
+        super().__init__()
+        self.attn = torch.nn.MultiheadAttention(embed_dim=model_dim, num_heads=num_heads, dropout=dropout, batch_first=True)
+        self.norm = torch.nn.LayerNorm(model_dim)
+        self.ffn = torch.nn.Sequential(
+            torch.nn.Linear(model_dim, model_dim * 2),
+            torch.nn.ReLU(),
+            torch.nn.Linear(model_dim * 2, model_dim)
+        )
+        self.dropout = torch.nn.Dropout(dropout)
+
+    def forward(self, x):
+        # x: (B, L, D)
+        residual = x
+        x, _ = self.attn(x, x, x)
+        x = self.dropout(x)
+        x = self.norm(residual + x)
+        x = x + self.ffn(x)
+        return x
 
 class LayerParams:
     def __init__(self, rnn_network: torch.nn.Module, layer_type: str):
@@ -71,6 +200,14 @@ class DCGRUCell(torch.nn.Module):
         self._fc_params = LayerParams(self, 'fc')
         self._gconv_params = LayerParams(self, 'gconv')
 
+        # self.spatial_attn = SelfAttentionLayer(model_dim=self._num_units)
+        self.spatial_attn = torch.nn.ModuleList(
+            [
+                SelfAttentionLayer(4, 256, 4, 0.1)
+                for _ in range(3)
+            ]
+        )
+
     @staticmethod
     def _build_sparse_matrix(L):
         L = L.tocoo()
@@ -100,6 +237,15 @@ class DCGRUCell(torch.nn.Module):
         u = torch.reshape(u, (-1, self._num_nodes * self._num_units))
 
         c = self._gconv(inputs, r * hx, self._num_units)
+
+        # Reshape (B, N * D) ? (B, N, D)
+        c = c.view(-1, self._num_nodes, self._num_units)
+        for attn in self.spatial_attn:
+            # print("c shape: ", c.shape)
+            c = attn(c, dim=1)
+        # c = self.spatial_attn(c)  # apply attention across nodes
+        c = c.view(-1, self._num_nodes * self._num_units)
+
         if self._activation is not None:
             c = self._activation(c)
 

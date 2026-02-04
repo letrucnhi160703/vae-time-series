@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 
 from dcrnn_cell import DCGRUCell
+from dcrnn_cell import SelfAttentionLayer
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -28,10 +29,19 @@ class EncoderModel(nn.Module, Seq2SeqAttrs):
         nn.Module.__init__(self)
         Seq2SeqAttrs.__init__(self, adj_mx, **model_kwargs)
         self.input_dim = int(model_kwargs.get('input_dim', 1))
-        self.seq_len = int(model_kwargs.get('seq_len'))  # for the encoder
+        self.seq_len = int(model_kwargs.get('seq_len'))
+        self.rnn_units = int(model_kwargs.get('rnn_units'))
         self.dcgru_layers = nn.ModuleList(
             [DCGRUCell(self.rnn_units, adj_mx, self.max_diffusion_step, self.num_nodes,
                        filter_type=self.filter_type) for _ in range(self.num_rnn_layers)])
+
+        # self.temporal_attn = SelfAttentionLayer(model_dim=self.rnn_units)
+        self.temporal_attn = nn.ModuleList(
+            [
+                SelfAttentionLayer(828, 256, 4, 0.1)
+                for _ in range(3)
+            ]
+        )
 
     def forward(self, inputs, hidden_state=None):
         """
@@ -48,10 +58,13 @@ class EncoderModel(nn.Module, Seq2SeqAttrs):
         if hidden_state is None:
             hidden_state = torch.zeros((self.num_rnn_layers, batch_size, self.hidden_state_size),
                                        device=device)
-        hidden_states = []
+        
+        # print("inputs shape: ", inputs.shape)
         output = inputs
+        hidden_states = []
         for layer_num, dcgru_layer in enumerate(self.dcgru_layers):
             next_hidden_state = dcgru_layer(output, hidden_state[layer_num])
+            # print("next_hidden_state shape: ", next_hidden_state.shape)
             hidden_states.append(next_hidden_state)
             output = next_hidden_state
 
@@ -69,6 +82,8 @@ class DecoderModel(nn.Module, Seq2SeqAttrs):
         self.dcgru_layers = nn.ModuleList(
             [DCGRUCell(self.rnn_units, adj_mx, self.max_diffusion_step, self.num_nodes,
                        filter_type=self.filter_type) for _ in range(self.num_rnn_layers)])
+        self.final_layer = nn.Linear(self.num_nodes * self.output_dim, self.num_nodes * self.output_dim)
+
 
     def forward(self, inputs, hidden_state=None):
         """
@@ -91,6 +106,8 @@ class DecoderModel(nn.Module, Seq2SeqAttrs):
         projected = self.projection_layer(output.view(-1, self.rnn_units))
         output = projected.view(-1, self.num_nodes * self.output_dim)
 
+        output = self.final_layer(output)
+
         return output, torch.stack(hidden_states)
 
 
@@ -102,7 +119,6 @@ class DCRNNModel(nn.Module, Seq2SeqAttrs):
         self.decoder_model = DecoderModel(adj_mx, **model_kwargs)
         self.cl_decay_steps = int(model_kwargs.get('cl_decay_steps', 1000))
         self.use_curriculum_learning = bool(model_kwargs.get('use_curriculum_learning', False))
-        # self._logger = logger
 
     def _compute_sampling_threshold(self, batches_seen):
         return self.cl_decay_steps / (
@@ -115,15 +131,48 @@ class DCRNNModel(nn.Module, Seq2SeqAttrs):
         :return: encoder_hidden_state: (num_layers, batch_size, self.hidden_state_size)
         """
 
-        output = []
+        # output = []
+        # encoder_hidden_state = None
+        # for t in range(self.encoder_model.seq_len):
+        #     _, encoder_hidden_state = self.encoder_model(inputs[t], encoder_hidden_state)
+        #     output.append(encoder_hidden_state)
+
+        # output = torch.stack(output, dim=0)
+
+        # return encoder_hidden_state, output # output: 12, 2, 4, 828
+
         encoder_hidden_state = None
+        output = []
+
         for t in range(self.encoder_model.seq_len):
             _, encoder_hidden_state = self.encoder_model(inputs[t], encoder_hidden_state)
-            output.append(encoder_hidden_state)
+            output.append(encoder_hidden_state)  # (batch_size, num_nodes * rnn_units)
 
-        output = torch.stack(output, dim=0)
+        # print("output shape: ", output.shape)
+        # (seq_len, batch_size, hidden_dim) ? (batch_size, seq_len, hidden_dim)
+        temporal_input = torch.stack(output, dim=0) # 12, 2, 4, 828
+        # print("temporal_input shape before: ", temporal_input.shape)
 
-        return encoder_hidden_state, output
+        # temporal_input: (T=12, L=2, B=4, D=828)
+        T, L, B, D = temporal_input.shape
+
+        # transpose d? dua v? (L, B, T, D)
+        temporal_input = temporal_input.permute(1, 2, 0, 3)  # (num_layers, batch_size, seq_len, hidden_dim)
+
+        # áp d?ng attention cho t?ng layer riêng bi?t
+        attended_list = []
+        for l in range(L):
+            x = temporal_input[l]  # (B, T, D)
+            # print("x shape: ", x.shape)
+            for attn in self.encoder_model.temporal_attn:
+                x_att = attn(x, dim=1)
+            # x_att = self.encoder_model.temporal_attn(x)  # (B, T, D)
+            attended_list.append(x_att)
+
+        # Stack l?i: (L, B, T, D) ? (T, L, B, D)
+        attended = torch.stack(attended_list, dim=0).permute(2, 0, 1, 3)  # (T, L, B, D)
+
+        return encoder_hidden_state, attended
 
     def decoder(self, encoder_hidden_state, labels=None, batches_seen=None):
         """
